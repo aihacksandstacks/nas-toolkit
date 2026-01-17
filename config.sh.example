@@ -8,7 +8,8 @@
 # NAS Connection
 export NAS_HOSTNAME="your-nas-hostname"      # Friendly name for your NAS
 export NAS_IP="100.x.x.x"                    # Tailscale IP or local IP
-export NAS_USER="your-username"              # SSH username for NAS
+export NAS_USER="your-username"              # SMB/SSH username for NAS
+# Password is handled by macOS Keychain - mount via Finder first to save credentials
 export NAS_SSH_HOST="nas"                    # SSH config alias (created by nas-setup)
 
 # SMB Mount Settings

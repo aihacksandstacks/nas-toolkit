@@ -1,0 +1,428 @@
+#!/bin/zsh
+#
+# nas-cache - Manage package caches on NAS
+#
+# Moves large package caches (npm, pip, homebrew, etc.) to NAS and
+# creates symlinks so tools continue to work transparently.
+#
+# Usage:
+#   nas-cache status          # Show cache status and sizes
+#   nas-cache setup           # Interactive setup of all caches
+#   nas-cache move <cache>    # Move specific cache to NAS
+#   nas-cache restore <cache> # Restore cache from NAS to local
+#   nas-cache list            # List available cache types
+#
+set -e
+
+SCRIPT_DIR="${0:A:h}"
+source "$SCRIPT_DIR/../lib/common.sh"
+
+# Cache definitions: name|local_path|nas_subdir|description
+typeset -A CACHES
+CACHES=(
+    ["npm"]="$HOME/.npm|npm|Node.js package cache"
+    ["pip"]="$HOME/Library/Caches/pip|pip|Python pip cache"
+    ["pypoetry"]="$HOME/Library/Caches/pypoetry|pypoetry|Python Poetry cache"
+    ["homebrew"]="$HOME/Library/Caches/Homebrew|homebrew|Homebrew download cache"
+    ["cargo"]="$HOME/.cargo|cargo|Rust cargo cache"
+    ["uv"]="$HOME/.cache/uv|uv|Python uv package manager cache"
+    ["yarn"]="$HOME/.yarn/cache|yarn|Yarn package cache"
+    ["pnpm"]="$HOME/.pnpm-store|pnpm|pnpm package store"
+    ["go"]="$HOME/go/pkg/mod|go-mod|Go module cache"
+    ["gradle"]="$HOME/.gradle/caches|gradle|Gradle build cache"
+    ["maven"]="$HOME/.m2/repository|maven|Maven repository cache"
+    ["cocoapods"]="$HOME/Library/Caches/CocoaPods|cocoapods|CocoaPods cache"
+    ["playwright"]="$HOME/Library/Caches/ms-playwright|playwright|Playwright browser binaries"
+)
+
+show_help() {
+    cat << EOF
+${BOLD}nas-cache${NC} - Manage package caches on NAS
+
+${BOLD}USAGE:${NC}
+    nas-cache <command> [options]
+
+${BOLD}COMMANDS:${NC}
+    status              Show status and sizes of all caches
+    setup               Interactive setup - move all large caches to NAS
+    move <cache>        Move a specific cache to NAS (creates symlink)
+    restore <cache>     Restore cache from NAS to local storage
+    list                List all supported cache types
+    verify              Verify all symlinks are working
+
+${BOLD}SUPPORTED CACHES:${NC}
+    npm, pip, pypoetry, homebrew, cargo, uv, yarn, pnpm,
+    go, gradle, maven, cocoapods, playwright
+
+${BOLD}EXAMPLES:${NC}
+    nas-cache status            # See what's using space
+    nas-cache setup             # Move all caches interactively
+    nas-cache move npm          # Move just npm cache
+    nas-cache restore pip       # Bring pip cache back local
+
+${BOLD}HOW IT WORKS:${NC}
+    1. Copies cache contents to NAS via rsync
+    2. Removes local directory
+    3. Creates symlink pointing to NAS location
+    4. Tools continue working transparently
+
+EOF
+}
+
+get_cache_info() {
+    local cache=$1
+    echo "${CACHES[$cache]}"
+}
+
+get_local_path() {
+    local cache=$1
+    echo "${CACHES[$cache]}" | cut -d'|' -f1
+}
+
+get_nas_subdir() {
+    local cache=$1
+    echo "${CACHES[$cache]}" | cut -d'|' -f2
+}
+
+get_description() {
+    local cache=$1
+    echo "${CACHES[$cache]}" | cut -d'|' -f3
+}
+
+list_caches() {
+    print_header "Supported Caches"
+    echo ""
+    printf "  ${BOLD}%-15s %-45s${NC}\n" "NAME" "DESCRIPTION"
+    hr
+    for cache in "${(k)CACHES}"; do
+        local desc=$(get_description "$cache")
+        printf "  %-15s %s\n" "$cache" "$desc"
+    done | sort
+    echo ""
+}
+
+show_status() {
+    print_header "Cache Status"
+
+    if ! check_nas_ssh 2>/dev/null; then
+        log_warn "Cannot connect to NAS - showing local status only"
+    fi
+
+    echo ""
+    printf "  ${BOLD}%-15s %-10s %-10s %-20s${NC}\n" "CACHE" "SIZE" "LOCATION" "STATUS"
+    hr
+
+    local total_local=0
+    local total_nas=0
+
+    for cache in $(echo "${(k)CACHES}" | tr ' ' '\n' | sort); do
+        local local_path=$(get_local_path "$cache")
+        local nas_subdir=$(get_nas_subdir "$cache")
+        local nas_path="$NAS_CACHE_DIR/$nas_subdir"
+
+        local size="0"
+        local location="-"
+        local cache_status="${RED}Not found${NC}"
+
+        if [ -L "$local_path" ]; then
+            # It's a symlink
+            local target=$(readlink "$local_path")
+            if [[ "$target" == *"$NAS_STORAGE_BASE"* ]] || [[ "$target" == "/volume"* ]]; then
+                location="NAS"
+                cache_status="${GREEN}Symlinked${NC}"
+                # Get size from NAS if possible
+                if check_nas_ssh 2>/dev/null; then
+                    size=$(nas_run "du -sh '$nas_path' 2>/dev/null | cut -f1" || echo "?")
+                fi
+            else
+                location="Symlink"
+                cache_status="${YELLOW}Unknown target${NC}"
+            fi
+        elif [ -d "$local_path" ]; then
+            # Local directory
+            size=$(du -sh "$local_path" 2>/dev/null | cut -f1 || echo "?")
+            location="Local"
+            cache_status="${YELLOW}Local${NC}"
+            # Add to total
+            local size_bytes=$(get_dir_size_bytes "$local_path")
+            total_local=$((total_local + size_bytes))
+        fi
+
+        printf "  %-15s %-10s %-10s " "$cache" "$size" "$location"
+        echo -e "$cache_status"
+    done
+
+    echo ""
+    hr
+    if [ $total_local -gt 0 ]; then
+        local total_human=$(format_bytes $total_local)
+        echo -e "  ${BOLD}Local cache total: ${YELLOW}$total_human${NC} (could be moved to NAS)${NC}"
+    else
+        echo -e "  ${GREEN}All caches are on NAS or not present${NC}"
+    fi
+    echo ""
+}
+
+move_cache() {
+    local cache=$1
+
+    if [ -z "${CACHES[$cache]}" ]; then
+        log_error "Unknown cache: $cache"
+        log_info "Run 'nas-cache list' to see available caches"
+        return 1
+    fi
+
+    local local_path=$(get_local_path "$cache")
+    local nas_subdir=$(get_nas_subdir "$cache")
+    local nas_path="$NAS_CACHE_DIR/$nas_subdir"
+    local desc=$(get_description "$cache")
+
+    log_step "Moving $cache cache to NAS"
+    echo "  Description: $desc"
+    echo "  Local path:  $local_path"
+    echo "  NAS path:    $nas_path"
+    echo ""
+
+    # Check if already symlinked
+    if [ -L "$local_path" ]; then
+        log_info "$cache is already symlinked"
+        return 0
+    fi
+
+    # Check if local path exists
+    if [ ! -d "$local_path" ]; then
+        log_info "$cache directory does not exist locally"
+        if confirm "Create symlink to NAS anyway (for future use)?"; then
+            nas_mkdir "$nas_path"
+            mkdir -p "$(dirname "$local_path")"
+            ln -s "$nas_path" "$local_path"
+            log_success "Created symlink for future use"
+        fi
+        return 0
+    fi
+
+    # Check NAS connection
+    if ! check_nas_ssh; then
+        log_error "Cannot connect to NAS"
+        return 1
+    fi
+
+    local size=$(get_dir_size "$local_path")
+    log_info "Cache size: $size"
+    echo ""
+
+    if ! confirm "Move $cache ($size) to NAS?"; then
+        log_info "Skipped"
+        return 0
+    fi
+
+    # Create NAS directory
+    log_info "Creating NAS directory..."
+    nas_mkdir "$nas_path"
+
+    # Sync to NAS using tar+ssh (rsync blocked on UGREEN)
+    log_info "Syncing to NAS (this may take a while)..."
+    local cache_name=$(basename "$local_path")
+    tar -C "$(dirname "$local_path")" -cf - "$cache_name" 2>/dev/null | \
+        ssh "$NAS_SSH_HOST" "cd '$nas_path' && rm -rf * && tar -xf -"
+
+    # Move contents up from nested directory
+    nas_run "cd '$nas_path' && mv $cache_name/* . 2>/dev/null; rm -rf '$cache_name'" 2>/dev/null || true
+
+    # Verify sync
+    log_info "Verifying sync..."
+    local local_count=$(find "$local_path" -type f 2>/dev/null | wc -l | tr -d ' ')
+    local nas_count=$(nas_run "find '$nas_path' -type f 2>/dev/null | wc -l | tr -d ' '")
+
+    if [ "$local_count" != "$nas_count" ]; then
+        log_warn "File count mismatch (local: $local_count, NAS: $nas_count)"
+        if ! confirm "Continue anyway?"; then
+            log_error "Aborted - local directory preserved"
+            return 1
+        fi
+    fi
+
+    # Remove local and create symlink
+    log_info "Removing local directory..."
+    rm -rf "$local_path"
+
+    log_info "Creating symlink..."
+    ln -s "$nas_path" "$local_path"
+
+    log_success "$cache moved to NAS and symlinked"
+}
+
+restore_cache() {
+    local cache=$1
+
+    if [ -z "${CACHES[$cache]}" ]; then
+        log_error "Unknown cache: $cache"
+        return 1
+    fi
+
+    local local_path=$(get_local_path "$cache")
+    local nas_subdir=$(get_nas_subdir "$cache")
+    local nas_path="$NAS_CACHE_DIR/$nas_subdir"
+
+    log_step "Restoring $cache cache to local"
+
+    # Check if it's a symlink
+    if [ ! -L "$local_path" ]; then
+        log_info "$cache is not symlinked to NAS"
+        return 0
+    fi
+
+    if ! check_nas_ssh; then
+        log_error "Cannot connect to NAS"
+        return 1
+    fi
+
+    # Get size from NAS
+    local size=$(nas_run "du -sh '$nas_path' 2>/dev/null | cut -f1" || echo "unknown")
+    log_info "Cache size on NAS: $size"
+
+    if ! confirm "Restore $cache ($size) to local?"; then
+        log_info "Skipped"
+        return 0
+    fi
+
+    # Remove symlink
+    rm "$local_path"
+
+    # Create local directory
+    mkdir -p "$local_path"
+
+    # Sync from NAS
+    log_info "Syncing from NAS..."
+    rsync -avz --progress "$NAS_SSH_HOST:$nas_path/" "$local_path/"
+
+    log_success "$cache restored to local storage"
+}
+
+verify_symlinks() {
+    print_header "Verifying Cache Symlinks"
+    echo ""
+
+    local all_ok=true
+
+    for cache in $(echo "${(k)CACHES}" | tr ' ' '\n' | sort); do
+        local local_path=$(get_local_path "$cache")
+
+        if [ -L "$local_path" ]; then
+            local target=$(readlink "$local_path")
+            if [ -d "$local_path" ]; then
+                echo -e "  ${GREEN}OK${NC}  $cache -> $target"
+            else
+                echo -e "  ${RED}BROKEN${NC}  $cache -> $target (target not accessible)"
+                all_ok=false
+            fi
+        fi
+    done
+
+    echo ""
+    if $all_ok; then
+        log_success "All symlinks are working"
+    else
+        log_error "Some symlinks are broken - check NAS connection"
+    fi
+}
+
+interactive_setup() {
+    print_header "Cache Migration Setup"
+
+    if ! check_nas_ssh; then
+        log_error "Cannot connect to NAS. Run 'nas-setup' first."
+        exit 1
+    fi
+
+    echo ""
+    log_info "This will move large package caches to your NAS."
+    log_info "Tools will continue to work transparently via symlinks."
+    echo ""
+
+    # Find caches that exist locally and aren't symlinked
+    local caches_to_move=()
+    local total_size=0
+
+    for cache in $(echo "${(k)CACHES}" | tr ' ' '\n' | sort); do
+        local local_path=$(get_local_path "$cache")
+        if [ -d "$local_path" ] && [ ! -L "$local_path" ]; then
+            local size_bytes=$(get_dir_size_bytes "$local_path")
+            if [ "$size_bytes" -gt 104857600 ]; then  # > 100MB
+                caches_to_move+=("$cache")
+                total_size=$((total_size + size_bytes))
+            fi
+        fi
+    done
+
+    if [ ${#caches_to_move[@]} -eq 0 ]; then
+        log_success "No large local caches found to move"
+        return 0
+    fi
+
+    local total_human=$(format_bytes $total_size)
+    log_info "Found ${#caches_to_move[@]} caches totaling $total_human:"
+    echo ""
+
+    for cache in "${caches_to_move[@]}"; do
+        local local_path=$(get_local_path "$cache")
+        local size=$(get_dir_size "$local_path")
+        echo "  - $cache ($size)"
+    done
+    echo ""
+
+    if ! confirm "Move all these caches to NAS?"; then
+        log_info "You can move individual caches with 'nas-cache move <cache>'"
+        return 0
+    fi
+
+    echo ""
+    for cache in "${caches_to_move[@]}"; do
+        move_cache "$cache"
+        echo ""
+    done
+
+    log_success "Cache migration complete!"
+    log_info "Run 'nas-cache status' to verify"
+}
+
+# Main
+case "${1:-}" in
+    -h|--help)
+        show_help
+        ;;
+    status)
+        show_status
+        ;;
+    setup)
+        interactive_setup
+        ;;
+    move)
+        if [ -z "$2" ]; then
+            log_error "Usage: nas-cache move <cache>"
+            exit 1
+        fi
+        move_cache "$2"
+        ;;
+    restore)
+        if [ -z "$2" ]; then
+            log_error "Usage: nas-cache restore <cache>"
+            exit 1
+        fi
+        restore_cache "$2"
+        ;;
+    list)
+        list_caches
+        ;;
+    verify)
+        verify_symlinks
+        ;;
+    "")
+        show_help
+        ;;
+    *)
+        log_error "Unknown command: $1"
+        show_help
+        exit 1
+        ;;
+esac

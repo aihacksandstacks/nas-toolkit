@@ -1,0 +1,36 @@
+#!/bin/zsh
+# Mount NAS cache share via SMB
+#
+# Uses settings from config.sh
+
+SCRIPT_DIR="${0:A:h}"
+source "$SCRIPT_DIR/../config.sh"
+
+# Check if already mounted
+if mount | grep -q "$NAS_MOUNT_POINT"; then
+    echo "NAS already mounted at $NAS_MOUNT_POINT"
+    exit 0
+fi
+
+# Create mount point if it doesn't exist
+if [ ! -d "$NAS_MOUNT_POINT" ]; then
+    echo "Creating mount point..."
+    sudo mkdir -p "$NAS_MOUNT_POINT"
+fi
+
+# Check if NAS is reachable
+if ! ping -c 1 -W 2 "$NAS_IP" &>/dev/null; then
+    echo "NAS not reachable at $NAS_IP"
+    exit 1
+fi
+
+# Mount (will prompt for password first time, then use keychain)
+echo "Mounting NAS..."
+mount_smbfs -o nobrowse "//${NAS_USER}@${NAS_IP}/${NAS_SMB_SHARE}" "$NAS_MOUNT_POINT"
+
+if mount | grep -q "$NAS_MOUNT_POINT"; then
+    echo "Mounted successfully at $NAS_MOUNT_POINT"
+else
+    echo "Mount failed"
+    exit 1
+fi

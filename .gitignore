@@ -1,0 +1,20 @@
+# User configuration (contains personal NAS settings)
+config.sh
+
+# Generated files
+*.log
+firebase-debug.log
+
+# macOS
+.DS_Store
+._*
+
+# Editor files
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Local launchd plist (generated during install)
+com.nas-toolkit.health.local.plist

@@ -1,0 +1,253 @@
+#!/bin/zsh
+#
+# dev-restore - Restore archived projects from NAS
+#
+# Retrieves projects that were archived with dev-archive.
+#
+# Usage:
+#   dev-restore <project-name>     # Restore to ~/dev/
+#   dev-restore <project> --to /path   # Restore to specific location
+#   dev-restore --list             # List available archives
+#
+set -e
+
+SCRIPT_DIR="${0:A:h}"
+source "$SCRIPT_DIR/../lib/common.sh"
+
+show_help() {
+    cat << EOF
+${BOLD}dev-restore${NC} - Restore archived projects from NAS
+
+${BOLD}USAGE:${NC}
+    dev-restore <project-name>         Restore project to ~/dev/
+    dev-restore <project> --to PATH    Restore to specific location
+    dev-restore --list                 List available archives
+
+${BOLD}OPTIONS:${NC}
+    --to PATH           Restore to specific directory (default: ~/dev/)
+    --list, -l          List all available archived projects
+    --keep-archive      Keep archive on NAS after restore (default: keep)
+    --delete-archive    Delete archive from NAS after successful restore
+    -h, --help          Show this help message
+
+${BOLD}EXAMPLES:${NC}
+    dev-restore my-old-project         # Restore to ~/dev/my-old-project
+    dev-restore my-project --to /tmp   # Restore to /tmp/my-project
+    dev-restore --list                 # See what's available
+
+${BOLD}AFTER RESTORE:${NC}
+    You'll need to reinstall dependencies:
+    - Node.js: npm install / yarn / pnpm install
+    - Python:  uv sync / pip install -r requirements.txt
+
+EOF
+}
+
+# List archived projects
+list_archives() {
+    print_header "Available Archives"
+
+    if ! check_nas_ssh; then
+        log_error "Cannot connect to NAS"
+        exit 1
+    fi
+
+    local archives=$(nas_run "ls -1 '$NAS_ARCHIVE_DIR/repos/' 2>/dev/null" || echo "")
+
+    if [ -z "$archives" ]; then
+        log_info "No archived projects found"
+        return 0
+    fi
+
+    echo ""
+    printf "  ${BOLD}%-30s %-12s %-15s %-20s${NC}\n" "PROJECT" "SIZE" "ARCHIVED" "GIT REMOTE"
+    hr
+
+    while IFS= read -r archive; do
+        if [[ "$archive" == *.tar.gz ]]; then
+            local name="${archive%.tar.gz}"
+            local size=$(nas_run "du -sh '$NAS_ARCHIVE_DIR/repos/$archive' 2>/dev/null | cut -f1" || echo "?")
+            local date=$(nas_run "stat -c '%y' '$NAS_ARCHIVE_DIR/repos/$archive' 2>/dev/null | cut -d' ' -f1" || echo "?")
+
+            # Try to get git remote from metadata
+            local git_remote="?"
+            local metadata_file="$NAS_ARCHIVE_DIR/repos/${name}.json"
+            if nas_run "[ -f '$metadata_file' ]" 2>/dev/null; then
+                git_remote=$(nas_run "grep -o '\"git_remote\": \"[^\"]*\"' '$metadata_file' 2>/dev/null | cut -d'\"' -f4" || echo "?")
+                # Truncate long remotes
+                if [ ${#git_remote} -gt 18 ]; then
+                    git_remote="${git_remote:0:15}..."
+                fi
+            fi
+
+            printf "  %-30s %-12s %-15s %-20s\n" "$name" "$size" "$date" "$git_remote"
+        fi
+    done <<< "$archives"
+
+    echo ""
+    log_info "To restore: dev-restore <project-name>"
+}
+
+# Restore a project
+restore_project() {
+    local project_name=$1
+    local target_dir=${2:-$HOME/dev}
+    local delete_archive=${3:-false}
+
+    # Add .tar.gz if not present
+    local archive_name="$project_name"
+    [[ "$archive_name" != *.tar.gz ]] && archive_name="${archive_name}.tar.gz"
+    local base_name="${archive_name%.tar.gz}"
+
+    local nas_archive_path="$NAS_ARCHIVE_DIR/repos/$archive_name"
+    local restore_path="$target_dir/$base_name"
+
+    print_header "Restoring: $base_name"
+
+    # Check NAS connection
+    if ! check_nas_ssh; then
+        log_error "Cannot connect to NAS"
+        return 1
+    fi
+
+    # Check if archive exists
+    if ! nas_run "[ -f '$nas_archive_path' ]" 2>/dev/null; then
+        log_error "Archive not found: $archive_name"
+        log_info "Run 'dev-restore --list' to see available archives"
+        return 1
+    fi
+
+    # Check if target already exists
+    if [ -d "$restore_path" ]; then
+        log_warn "Directory already exists: $restore_path"
+        if ! confirm "Overwrite existing directory?"; then
+            log_info "Cancelled"
+            return 0
+        fi
+        rm -rf "$restore_path"
+    fi
+
+    # Get archive info
+    local archive_size=$(nas_run "du -sh '$nas_archive_path' 2>/dev/null | cut -f1" || echo "?")
+    local metadata_file="$NAS_ARCHIVE_DIR/repos/${base_name}.json"
+
+    echo ""
+    print_kv "Archive" "$archive_name"
+    print_kv "Size" "$archive_size"
+    print_kv "Restore to" "$restore_path"
+
+    # Show metadata if available
+    if nas_run "[ -f '$metadata_file' ]" 2>/dev/null; then
+        local original_path=$(nas_run "grep -o '\"original_path\": \"[^\"]*\"' '$metadata_file' 2>/dev/null | cut -d'\"' -f4" || echo "?")
+        local archived_at=$(nas_run "grep -o '\"archived_at\": \"[^\"]*\"' '$metadata_file' 2>/dev/null | cut -d'\"' -f4" || echo "?")
+        print_kv "Original Path" "$original_path"
+        print_kv "Archived At" "$archived_at"
+    fi
+
+    echo ""
+
+    if ! confirm "Restore this project?"; then
+        log_info "Cancelled"
+        return 0
+    fi
+
+    # Create target directory
+    mkdir -p "$target_dir"
+
+    # Download and extract
+    log_step "Downloading archive..."
+    local temp_archive="/tmp/$archive_name"
+    rsync -avz --progress "$NAS_SSH_HOST:$nas_archive_path" "$temp_archive"
+
+    log_step "Extracting..."
+    tar -xzf "$temp_archive" -C "$target_dir"
+
+    # Cleanup temp file
+    rm -f "$temp_archive"
+
+    # Optionally delete from NAS
+    if $delete_archive; then
+        log_step "Removing archive from NAS..."
+        nas_run "rm -f '$nas_archive_path' '$metadata_file'"
+        log_info "Archive removed from NAS"
+    fi
+
+    echo ""
+    log_success "Project restored to: $restore_path"
+    echo ""
+
+    # Show next steps
+    log_info "Next steps:"
+    if [ -f "$restore_path/package.json" ]; then
+        echo "  npm install    # or: yarn / pnpm install"
+    fi
+    if [ -f "$restore_path/requirements.txt" ]; then
+        echo "  pip install -r requirements.txt"
+    fi
+    if [ -f "$restore_path/pyproject.toml" ]; then
+        echo "  uv sync    # or: poetry install / pip install -e ."
+    fi
+    if [ -f "$restore_path/Cargo.toml" ]; then
+        echo "  cargo build"
+    fi
+    echo ""
+}
+
+# Parse arguments
+TARGET_DIR="$HOME/dev"
+DELETE_ARCHIVE=false
+ACTION=""
+PROJECT_NAME=""
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -l|--list)
+            ACTION="list"
+            shift
+            ;;
+        --to)
+            TARGET_DIR=$2
+            shift 2
+            ;;
+        --keep-archive)
+            DELETE_ARCHIVE=false
+            shift
+            ;;
+        --delete-archive)
+            DELETE_ARCHIVE=true
+            shift
+            ;;
+        -*)
+            log_error "Unknown option: $1"
+            show_help
+            exit 1
+            ;;
+        *)
+            PROJECT_NAME=$1
+            ACTION="restore"
+            shift
+            ;;
+    esac
+done
+
+# Main
+case "$ACTION" in
+    list)
+        list_archives
+        ;;
+    restore)
+        if [ -z "$PROJECT_NAME" ]; then
+            log_error "Project name required"
+            show_help
+            exit 1
+        fi
+        restore_project "$PROJECT_NAME" "$TARGET_DIR" "$DELETE_ARCHIVE"
+        ;;
+    *)
+        show_help
+        ;;
+esac

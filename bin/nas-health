@@ -1,0 +1,47 @@
+#!/bin/zsh
+#
+# nas-health - Check and restore NAS mount if dropped
+#
+# Run periodically via launchd to ensure NAS stays mounted
+#
+
+SCRIPT_DIR="${0:A:h}"
+source "$SCRIPT_DIR/../config.sh"
+
+# Check if mount point exists
+if [ ! -d "$NAS_MOUNT_POINT" ]; then
+    echo "[nas-health] Mount point missing, creating..."
+    sudo mkdir -p "$NAS_MOUNT_POINT" 2>/dev/null
+fi
+
+# Check if mounted
+if mount | grep -q "$NAS_MOUNT_POINT"; then
+    # Verify it's accessible
+    if [ -d "$NAS_MOUNT_POINT/caches" ]; then
+        echo "[nas-health] NAS mounted and accessible"
+        exit 0
+    else
+        echo "[nas-health] Mount exists but not accessible, remounting..."
+        umount "$NAS_MOUNT_POINT" 2>/dev/null
+    fi
+fi
+
+# Check if NAS is reachable
+if ! ping -c 1 -W 2 "$NAS_IP" &>/dev/null; then
+    echo "[nas-health] NAS not reachable, skipping mount"
+    exit 0
+fi
+
+# Try to mount
+echo "[nas-health] Attempting to mount NAS..."
+"$SCRIPT_DIR/nas-mount" 2>/dev/null
+
+if mount | grep -q "$NAS_MOUNT_POINT"; then
+    echo "[nas-health] NAS remounted successfully"
+
+    # Send notification
+    osascript -e 'display notification "NAS cache remounted" with title "NAS Toolkit"' 2>/dev/null
+else
+    echo "[nas-health] Failed to remount NAS"
+    osascript -e 'display notification "Failed to remount NAS cache" with title "NAS Toolkit" sound name "Basso"' 2>/dev/null
+fi

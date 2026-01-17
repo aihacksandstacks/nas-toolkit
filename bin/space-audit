@@ -1,0 +1,420 @@
+#!/bin/zsh
+#
+# space-audit - Comprehensive disk usage analysis
+#
+# Analyzes disk usage across your Mac and provides actionable recommendations
+# for freeing up space using the nas-toolkit commands.
+#
+# Usage:
+#   space-audit              # Full system audit
+#   space-audit --quick      # Quick overview
+#   space-audit --dev        # Focus on ~/dev directory
+#   space-audit --caches     # Focus on caches
+#
+set -e
+
+SCRIPT_DIR="${0:A:h}"
+source "$SCRIPT_DIR/../lib/common.sh"
+
+show_help() {
+    cat << EOF
+${BOLD}space-audit${NC} - Comprehensive disk usage analysis
+
+${BOLD}USAGE:${NC}
+    space-audit [OPTIONS]
+
+${BOLD}OPTIONS:${NC}
+    --quick, -q         Quick overview of disk usage
+    --dev               Focus on ~/dev directory analysis
+    --caches            Focus on cache directories
+    --docker            Focus on Docker usage
+    --full              Complete analysis (default)
+    --json              Output in JSON format
+    -h, --help          Show this help message
+
+${BOLD}SECTIONS:${NC}
+    - Disk Overview     (total, used, available)
+    - Docker Usage      (images, containers, volumes)
+    - Package Caches    (npm, pip, homebrew, etc.)
+    - Development       (~/dev projects)
+    - System Caches     (Library/Caches)
+    - Recommendations   (actionable cleanup suggestions)
+
+${BOLD}EXAMPLES:${NC}
+    space-audit                # Full analysis with recommendations
+    space-audit --quick        # Just the numbers
+    space-audit --dev          # Focus on development projects
+
+EOF
+}
+
+# Get disk overview
+audit_disk_overview() {
+    log_step "Disk Overview"
+    echo ""
+
+    # Get disk info
+    local disk_info=$(df -h / | tail -1)
+    local total=$(echo "$disk_info" | awk '{print $2}')
+    local used=$(echo "$disk_info" | awk '{print $3}')
+    local avail=$(echo "$disk_info" | awk '{print $4}')
+    local pct=$(echo "$disk_info" | awk '{print $5}')
+
+    # Determine color based on usage
+    local pct_num=${pct%\%}
+    local color=$GREEN
+    if [ "$pct_num" -gt 90 ]; then
+        color=$RED
+    elif [ "$pct_num" -gt 80 ]; then
+        color=$YELLOW
+    fi
+
+    print_kv "Total Capacity" "$total"
+    print_kv "Used" "$used ($pct)" "$color"
+    print_kv "Available" "$avail"
+    echo ""
+}
+
+# Audit Docker usage
+audit_docker() {
+    log_step "Docker Usage"
+    echo ""
+
+    # Check Docker Desktop
+    local dd_path="$HOME/Library/Containers/com.docker.docker"
+    if [ -d "$dd_path" ]; then
+        local dd_size=$(du -sh "$dd_path" 2>/dev/null | cut -f1 || echo "?")
+        print_kv "Docker Desktop" "$dd_size" "$YELLOW"
+        echo -e "    ${CYAN}Recommendation: Run 'nas-setup --uninstall-docker-desktop'${NC}"
+    else
+        print_kv "Docker Desktop" "Not installed" "$GREEN"
+    fi
+
+    # Check Docker context
+    local current_context=$(docker context show 2>/dev/null || echo "none")
+    if [ "$current_context" = "nas" ]; then
+        print_kv "Docker Context" "NAS (good!)" "$GREEN"
+    else
+        print_kv "Docker Context" "$current_context" "$YELLOW"
+        if [ "$current_context" != "none" ]; then
+            echo -e "    ${CYAN}Recommendation: Run 'docker context use nas'${NC}"
+        fi
+    fi
+
+    # Get Docker disk usage if available
+    if docker info &>/dev/null; then
+        local docker_root=$(docker info 2>/dev/null | grep "Docker Root Dir" | cut -d: -f2 | tr -d ' ')
+        if [ -n "$docker_root" ] && [ -d "$docker_root" ]; then
+            local docker_size=$(du -sh "$docker_root" 2>/dev/null | cut -f1 || echo "?")
+            print_kv "Docker Data" "$docker_size"
+        fi
+    fi
+
+    echo ""
+}
+
+# Audit package caches
+audit_caches() {
+    log_step "Package Caches"
+    echo ""
+
+    local total_local=0
+    local total_nas=0
+
+    # Define caches to check
+    local -A cache_paths=(
+        ["npm"]="$HOME/.npm"
+        ["pip"]="$HOME/Library/Caches/pip"
+        ["pypoetry"]="$HOME/Library/Caches/pypoetry"
+        ["homebrew"]="$HOME/Library/Caches/Homebrew"
+        ["cargo"]="$HOME/.cargo"
+        ["uv"]="$HOME/.cache/uv"
+        ["yarn"]="$HOME/.yarn/cache"
+        ["pnpm"]="$HOME/.pnpm-store"
+        ["playwright"]="$HOME/Library/Caches/ms-playwright"
+    )
+
+    printf "  %-15s %-10s %-10s\n" "CACHE" "SIZE" "LOCATION"
+    hr
+
+    for cache in npm pip pypoetry homebrew cargo uv yarn pnpm playwright; do
+        local path="${cache_paths[$cache]}"
+        local size="0"
+        local location="-"
+        local color=$NC
+
+        if [ -L "$path" ]; then
+            location="NAS"
+            color=$GREEN
+            size="(NAS)"
+        elif [ -d "$path" ]; then
+            size=$(du -sh "$path" 2>/dev/null | cut -f1 || echo "?")
+            location="Local"
+            color=$YELLOW
+            local size_bytes=$(du -sk "$path" 2>/dev/null | cut -f1 || echo 0)
+            total_local=$((total_local + size_bytes * 1024))
+        fi
+
+        if [ "$size" != "0" ]; then
+            printf "  %-15s %-10s " "$cache" "$size"
+            echo -e "${color}$location${NC}"
+        fi
+    done
+
+    echo ""
+    if [ $total_local -gt 0 ]; then
+        local total_human=$(format_bytes $total_local)
+        echo -e "  ${BOLD}Local caches: ${YELLOW}$total_human${NC}"
+        echo -e "  ${CYAN}Recommendation: Run 'nas-cache setup' to move to NAS${NC}"
+    else
+        echo -e "  ${GREEN}All major caches on NAS or not present${NC}"
+    fi
+
+    echo ""
+}
+
+# Audit system caches
+audit_system_caches() {
+    log_step "System Caches (Library/Caches)"
+    echo ""
+
+    local cache_dir="$HOME/Library/Caches"
+    local total_size=$(du -sh "$cache_dir" 2>/dev/null | cut -f1 || echo "?")
+    print_kv "Total" "$total_size"
+    echo ""
+
+    echo "  Top consumers:"
+    du -sh "$cache_dir"/*/ 2>/dev/null | sort -hr | head -8 | while read -r size dir; do
+        local name=$(basename "$dir")
+        printf "    %-35s %s\n" "$name" "$size"
+    done
+
+    echo ""
+    echo -e "  ${CYAN}Note: Most system caches can be safely cleared but will regenerate${NC}"
+    echo ""
+}
+
+# Audit development directory
+audit_dev() {
+    log_step "Development Projects (~/dev)"
+    echo ""
+
+    local dev_dir="$HOME/dev"
+    if [ ! -d "$dev_dir" ]; then
+        log_info "~/dev directory not found"
+        return 0
+    fi
+
+    local total_size=$(du -sh "$dev_dir" 2>/dev/null | cut -f1 || echo "?")
+    print_kv "Total ~/dev" "$total_size"
+    echo ""
+
+    # Count cleanable items
+    local node_modules_count=$(find "$dev_dir" -maxdepth 4 -type d -name "node_modules" 2>/dev/null | wc -l | tr -d ' ')
+    local venv_count=$(find "$dev_dir" -maxdepth 4 -type d \( -name ".venv" -o -name "venv" \) 2>/dev/null | wc -l | tr -d ' ')
+
+    if [ "$node_modules_count" -gt 0 ] || [ "$venv_count" -gt 0 ]; then
+        echo "  Cleanable items found:"
+        [ "$node_modules_count" -gt 0 ] && echo "    - $node_modules_count node_modules directories"
+        [ "$venv_count" -gt 0 ] && echo "    - $venv_count Python virtual environments"
+        echo ""
+        echo -e "  ${CYAN}Recommendation: Run 'dev-clean' to remove regenerable files${NC}"
+        echo ""
+    fi
+
+    # Top projects by size
+    echo "  Largest projects:"
+    du -sh "$dev_dir"/*/ 2>/dev/null | sort -hr | head -5 | while read -r size dir; do
+        local name=$(basename "$dir")
+        printf "    %-35s %s\n" "$name" "$size"
+    done
+
+    # Find stale projects
+    echo ""
+    local stale_count=$(find "$dev_dir" -maxdepth 3 -type d -name ".git" 2>/dev/null | while read -r git_dir; do
+        local project_dir=$(dirname "$git_dir")
+        local recent=$(find "$project_dir" -type f -not -path "*/.git/*" -not -path "*/node_modules/*" -mtime -30 2>/dev/null | head -1)
+        [ -z "$recent" ] && echo "1"
+    done | wc -l | tr -d ' ')
+
+    if [ "$stale_count" -gt 0 ]; then
+        echo -e "  ${YELLOW}Found $stale_count projects not modified in 30+ days${NC}"
+        echo -e "  ${CYAN}Recommendation: Run 'dev-archive --suggest' to see candidates${NC}"
+    fi
+
+    echo ""
+}
+
+# Generate recommendations
+generate_recommendations() {
+    print_header "Recommendations"
+    echo ""
+
+    local total_recoverable=0
+    local recommendations=()
+
+    # Check Docker Desktop
+    local dd_path="$HOME/Library/Containers/com.docker.docker"
+    if [ -d "$dd_path" ]; then
+        local dd_size_bytes=$(du -sk "$dd_path" 2>/dev/null | cut -f1 || echo 0)
+        dd_size_bytes=$((dd_size_bytes * 1024))
+        total_recoverable=$((total_recoverable + dd_size_bytes))
+        recommendations+=("1|$(format_bytes $dd_size_bytes)|Uninstall Docker Desktop|nas-setup --uninstall-docker-desktop")
+    fi
+
+    # Check local caches
+    local -A cache_paths=(
+        ["npm"]="$HOME/.npm"
+        ["pip"]="$HOME/Library/Caches/pip"
+        ["pypoetry"]="$HOME/Library/Caches/pypoetry"
+    )
+
+    local cache_total=0
+    for cache in "${!cache_paths[@]}"; do
+        local path="${cache_paths[$cache]}"
+        if [ -d "$path" ] && [ ! -L "$path" ]; then
+            local size_bytes=$(du -sk "$path" 2>/dev/null | cut -f1 || echo 0)
+            cache_total=$((cache_total + size_bytes * 1024))
+        fi
+    done
+
+    if [ $cache_total -gt 104857600 ]; then  # > 100MB
+        total_recoverable=$((total_recoverable + cache_total))
+        recommendations+=("2|$(format_bytes $cache_total)|Move package caches to NAS|nas-cache setup")
+    fi
+
+    # Check for cleanable dev artifacts
+    local dev_dir="$HOME/dev"
+    if [ -d "$dev_dir" ]; then
+        local cleanable_estimate=0
+        local nm_size=$(find "$dev_dir" -maxdepth 4 -type d -name "node_modules" -exec du -sk {} \; 2>/dev/null | awk '{sum+=$1} END {print sum*1024}')
+        local venv_size=$(find "$dev_dir" -maxdepth 4 -type d \( -name ".venv" -o -name "venv" \) -exec du -sk {} \; 2>/dev/null | awk '{sum+=$1} END {print sum*1024}')
+        cleanable_estimate=$((${nm_size:-0} + ${venv_size:-0}))
+
+        if [ "$cleanable_estimate" -gt 104857600 ]; then  # > 100MB
+            total_recoverable=$((total_recoverable + cleanable_estimate))
+            recommendations+=("3|$(format_bytes $cleanable_estimate)|Clean dev project artifacts|dev-clean --all")
+        fi
+    fi
+
+    # Display recommendations
+    if [ ${#recommendations[@]} -eq 0 ]; then
+        log_success "Your system is well optimized! No major recommendations."
+    else
+        printf "  ${BOLD}#  %-12s %-35s %-30s${NC}\n" "SAVINGS" "ACTION" "COMMAND"
+        hr
+
+        for rec in "${recommendations[@]}"; do
+            IFS='|' read -r num savings action command <<< "$rec"
+            printf "  %-2s ${GREEN}%-12s${NC} %-35s ${CYAN}%s${NC}\n" "$num" "$savings" "$action" "$command"
+        done
+
+        echo ""
+        hr
+        local total_human=$(format_bytes $total_recoverable)
+        echo -e "  ${BOLD}Total recoverable space: ${GREEN}$total_human${NC}"
+    fi
+
+    echo ""
+}
+
+# Quick audit
+quick_audit() {
+    print_header "Quick Space Audit"
+    echo ""
+
+    # Disk overview
+    local disk_info=$(df -h / | tail -1)
+    local used=$(echo "$disk_info" | awk '{print $3}')
+    local avail=$(echo "$disk_info" | awk '{print $4}')
+    local pct=$(echo "$disk_info" | awk '{print $5}')
+
+    print_kv "Disk Used" "$used ($pct)"
+    print_kv "Available" "$avail"
+    echo ""
+
+    # Quick stats
+    local docker_size="N/A"
+    [ -d "$HOME/Library/Containers/com.docker.docker" ] && docker_size=$(du -sh "$HOME/Library/Containers/com.docker.docker" 2>/dev/null | cut -f1)
+    local npm_size=$(du -sh "$HOME/.npm" 2>/dev/null | cut -f1 || echo "0")
+    local caches_size=$(du -sh "$HOME/Library/Caches" 2>/dev/null | cut -f1 || echo "0")
+    local dev_size=$(du -sh "$HOME/dev" 2>/dev/null | cut -f1 || echo "0")
+
+    print_kv "Docker Desktop" "$docker_size"
+    print_kv "npm Cache" "$npm_size"
+    print_kv "Library/Caches" "$caches_size"
+    print_kv "~/dev" "$dev_size"
+    echo ""
+}
+
+# Full audit
+full_audit() {
+    print_header "Full Space Audit"
+
+    audit_disk_overview
+    audit_docker
+    audit_caches
+    audit_system_caches
+    audit_dev
+    generate_recommendations
+}
+
+# Parse arguments
+ACTION="full"
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -q|--quick)
+            ACTION="quick"
+            shift
+            ;;
+        --dev)
+            ACTION="dev"
+            shift
+            ;;
+        --caches)
+            ACTION="caches"
+            shift
+            ;;
+        --docker)
+            ACTION="docker"
+            shift
+            ;;
+        --full)
+            ACTION="full"
+            shift
+            ;;
+        *)
+            log_error "Unknown option: $1"
+            show_help
+            exit 1
+            ;;
+    esac
+done
+
+# Main
+case "$ACTION" in
+    quick)
+        quick_audit
+        ;;
+    dev)
+        print_header "Development Audit"
+        audit_dev
+        ;;
+    caches)
+        print_header "Cache Audit"
+        audit_caches
+        audit_system_caches
+        ;;
+    docker)
+        print_header "Docker Audit"
+        audit_docker
+        ;;
+    full)
+        full_audit
+        ;;
+esac

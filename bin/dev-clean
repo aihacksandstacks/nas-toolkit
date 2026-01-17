@@ -1,0 +1,328 @@
+#!/bin/zsh
+#
+# dev-clean - Clean up development project artifacts
+#
+# Removes node_modules, virtual environments, build artifacts, and other
+# regenerable files from development projects to reclaim disk space.
+#
+# Usage:
+#   dev-clean                    # Scan ~/dev and show what can be cleaned
+#   dev-clean --dry-run          # Show what would be cleaned without removing
+#   dev-clean --all              # Clean all projects without prompting
+#   dev-clean /path/to/project   # Clean specific project
+#   dev-clean --stale 30         # Only clean projects not modified in 30 days
+#
+set -e
+
+SCRIPT_DIR="${0:A:h}"
+source "$SCRIPT_DIR/../lib/common.sh"
+
+# Default settings
+DEV_DIR="$HOME/dev"
+DRY_RUN=false
+CLEAN_ALL=false
+STALE_DAYS=0
+SPECIFIC_PROJECT=""
+
+# Patterns to clean
+CLEAN_PATTERNS=(
+    "node_modules"
+    ".venv"
+    "venv"
+    "__pycache__"
+    ".pytest_cache"
+    ".mypy_cache"
+    ".ruff_cache"
+    "dist"
+    "build"
+    ".next"
+    ".nuxt"
+    ".turbo"
+    ".parcel-cache"
+    ".cache"
+    "coverage"
+    ".nyc_output"
+    "*.egg-info"
+    ".tox"
+    ".eggs"
+    "target"           # Rust/Java
+    ".gradle"          # Gradle local
+    ".dart_tool"
+    ".pub-cache"
+)
+
+# Patterns to preserve (never delete these even if they match)
+PRESERVE_PATTERNS=(
+    ".git"
+    ".env"
+    ".env.*"
+    "*.lock"
+    "package-lock.json"
+    "yarn.lock"
+    "pnpm-lock.yaml"
+    "poetry.lock"
+    "Cargo.lock"
+    "go.sum"
+)
+
+show_help() {
+    cat << EOF
+${BOLD}dev-clean${NC} - Clean up development project artifacts
+
+${BOLD}USAGE:${NC}
+    dev-clean [OPTIONS] [PATH]
+
+${BOLD}OPTIONS:${NC}
+    --dry-run, -n       Show what would be cleaned without removing
+    --all, -a           Clean all found artifacts without prompting
+    --stale DAYS        Only clean projects not modified in DAYS days
+    --dir PATH          Set base directory to scan (default: ~/dev)
+    -h, --help          Show this help message
+
+${BOLD}WHAT GETS CLEANED:${NC}
+    - node_modules      (npm/yarn/pnpm dependencies)
+    - .venv, venv       (Python virtual environments)
+    - __pycache__       (Python bytecode)
+    - dist, build       (Build output directories)
+    - .next, .nuxt      (Framework build caches)
+    - .turbo            (Turborepo cache)
+    - coverage          (Test coverage reports)
+    - target            (Rust/Java build output)
+
+${BOLD}PRESERVED:${NC}
+    - .git              (Version control)
+    - *.lock files      (Dependency lockfiles)
+    - .env files        (Environment configuration)
+
+${BOLD}EXAMPLES:${NC}
+    dev-clean                      # Interactive scan of ~/dev
+    dev-clean --dry-run            # Preview what would be removed
+    dev-clean --stale 30           # Clean projects untouched for 30 days
+    dev-clean ~/dev/old-project    # Clean specific project
+    dev-clean --all --stale 60     # Auto-clean all stale projects
+
+EOF
+}
+
+# Check if a project was modified within N days
+is_recently_modified() {
+    local project_dir=$1
+    local days=$2
+
+    if [ "$days" -eq 0 ]; then
+        return 0  # No stale filter, consider all projects
+    fi
+
+    # Check most recent file modification
+    local recent=$(find "$project_dir" -type f -mtime -"$days" 2>/dev/null | head -1)
+    [ -n "$recent" ]
+}
+
+# Get the last modification time of a project
+get_last_modified() {
+    local project_dir=$1
+    local latest_file=$(find "$project_dir" -type f -not -path "*/.git/*" -not -path "*/node_modules/*" -not -path "*/.venv/*" -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1)
+    if [ -n "$latest_file" ]; then
+        local timestamp=$(echo "$latest_file" | cut -d' ' -f1)
+        date -r "${timestamp%.*}" "+%Y-%m-%d" 2>/dev/null || echo "unknown"
+    else
+        echo "unknown"
+    fi
+}
+
+# Find cleanable directories in a project
+find_cleanable() {
+    local project_dir=$1
+    local results=()
+
+    for pattern in "${CLEAN_PATTERNS[@]}"; do
+        while IFS= read -r -d '' dir; do
+            # Skip if inside node_modules or .venv (don't double-count)
+            if [[ "$dir" == *"/node_modules/"* ]] || [[ "$dir" == *"/.venv/"* ]]; then
+                continue
+            fi
+            results+=("$dir")
+        done < <(find "$project_dir" -maxdepth 4 -type d -name "$pattern" -print0 2>/dev/null)
+    done
+
+    printf '%s\n' "${results[@]}"
+}
+
+# Calculate total size of cleanable items
+get_cleanable_size() {
+    local items=("$@")
+    local total=0
+
+    for item in "${items[@]}"; do
+        if [ -d "$item" ]; then
+            local size=$(du -sk "$item" 2>/dev/null | cut -f1 || echo 0)
+            total=$((total + size * 1024))
+        fi
+    done
+
+    echo $total
+}
+
+# Clean a single project
+clean_project() {
+    local project_dir=$1
+    local project_name=$(basename "$project_dir")
+
+    log_step "Scanning: $project_name"
+
+    # Find cleanable items
+    local cleanable=()
+    while IFS= read -r item; do
+        [ -n "$item" ] && cleanable+=("$item")
+    done < <(find_cleanable "$project_dir")
+
+    if [ ${#cleanable[@]} -eq 0 ]; then
+        log_info "Nothing to clean"
+        return 0
+    fi
+
+    # Calculate size
+    local total_size=$(get_cleanable_size "${cleanable[@]}")
+    local size_human=$(format_bytes $total_size)
+
+    echo ""
+    log_info "Found ${#cleanable[@]} items ($size_human):"
+
+    for item in "${cleanable[@]}"; do
+        local item_size=$(du -sh "$item" 2>/dev/null | cut -f1 || echo "?")
+        local rel_path="${item#$project_dir/}"
+        echo "    $rel_path ($item_size)"
+    done
+
+    echo ""
+
+    if $DRY_RUN; then
+        log_info "[DRY RUN] Would remove $size_human"
+        return 0
+    fi
+
+    if ! $CLEAN_ALL; then
+        if ! confirm "Remove these items?"; then
+            log_info "Skipped"
+            return 0
+        fi
+    fi
+
+    # Remove items
+    for item in "${cleanable[@]}"; do
+        rm -rf "$item"
+    done
+
+    log_success "Cleaned $size_human from $project_name"
+    echo "$total_size"
+}
+
+# Scan and clean all projects
+scan_projects() {
+    local base_dir=$1
+
+    print_header "Development Project Cleanup"
+
+    if [ ! -d "$base_dir" ]; then
+        log_error "Directory not found: $base_dir"
+        exit 1
+    fi
+
+    echo ""
+    log_info "Scanning: $base_dir"
+    if [ "$STALE_DAYS" -gt 0 ]; then
+        log_info "Only including projects not modified in $STALE_DAYS days"
+    fi
+    if $DRY_RUN; then
+        log_warn "DRY RUN - no files will be removed"
+    fi
+    echo ""
+
+    # Find all project directories (directories with .git or package.json)
+    local projects=()
+    while IFS= read -r -d '' git_dir; do
+        local project_dir=$(dirname "$git_dir")
+        if [ "$STALE_DAYS" -eq 0 ] || ! is_recently_modified "$project_dir" "$STALE_DAYS"; then
+            projects+=("$project_dir")
+        fi
+    done < <(find "$base_dir" -maxdepth 3 -type d -name ".git" -print0 2>/dev/null)
+
+    if [ ${#projects[@]} -eq 0 ]; then
+        log_info "No projects found to clean"
+        return 0
+    fi
+
+    log_info "Found ${#projects[@]} projects to scan"
+    echo ""
+
+    local total_cleaned=0
+    local projects_cleaned=0
+
+    for project in "${projects[@]}"; do
+        local cleaned=$(clean_project "$project")
+        if [ -n "$cleaned" ] && [ "$cleaned" -gt 0 ]; then
+            total_cleaned=$((total_cleaned + cleaned))
+            projects_cleaned=$((projects_cleaned + 1))
+        fi
+        echo ""
+    done
+
+    hr
+    if [ $total_cleaned -gt 0 ]; then
+        local total_human=$(format_bytes $total_cleaned)
+        if $DRY_RUN; then
+            log_info "Would clean $total_human from $projects_cleaned projects"
+        else
+            log_success "Cleaned $total_human from $projects_cleaned projects"
+        fi
+    else
+        log_info "No items cleaned"
+    fi
+}
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -n|--dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        -a|--all)
+            CLEAN_ALL=true
+            shift
+            ;;
+        --stale)
+            STALE_DAYS=$2
+            shift 2
+            ;;
+        --dir)
+            DEV_DIR=$2
+            shift 2
+            ;;
+        -*)
+            log_error "Unknown option: $1"
+            show_help
+            exit 1
+            ;;
+        *)
+            SPECIFIC_PROJECT=$1
+            shift
+            ;;
+    esac
+done
+
+# Main
+if [ -n "$SPECIFIC_PROJECT" ]; then
+    if [ -d "$SPECIFIC_PROJECT" ]; then
+        clean_project "$SPECIFIC_PROJECT"
+    else
+        log_error "Directory not found: $SPECIFIC_PROJECT"
+        exit 1
+    fi
+else
+    scan_projects "$DEV_DIR"
+fi

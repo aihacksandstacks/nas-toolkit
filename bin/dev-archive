@@ -1,0 +1,382 @@
+#!/bin/zsh
+#
+# dev-archive - Archive development projects to NAS
+#
+# Moves inactive projects to NAS cold storage to free local disk space.
+# Projects can be restored later with dev-restore.
+#
+# Usage:
+#   dev-archive /path/to/project   # Archive specific project
+#   dev-archive --list             # List archived projects on NAS
+#   dev-archive --stale 90         # Find projects to archive (90 days inactive)
+#   dev-archive --suggest          # Suggest projects to archive based on activity
+#
+set -e
+
+SCRIPT_DIR="${0:A:h}"
+source "$SCRIPT_DIR/../lib/common.sh"
+
+# Archive index file (tracks what's been archived)
+ARCHIVE_INDEX="$HOME/.nas-toolkit-archives.json"
+
+show_help() {
+    cat << EOF
+${BOLD}dev-archive${NC} - Archive development projects to NAS
+
+${BOLD}USAGE:${NC}
+    dev-archive <project>          Archive a specific project
+    dev-archive --list             List all archived projects
+    dev-archive --suggest          Suggest projects to archive based on activity
+    dev-archive --stale DAYS       Show projects not modified in DAYS days
+    dev-archive --clean            Clean local copy after archiving
+
+${BOLD}OPTIONS:${NC}
+    --list, -l          List archived projects on NAS
+    --suggest, -s       Analyze projects and suggest archival candidates
+    --stale DAYS        Filter to projects inactive for DAYS days
+    --clean             Remove local copy after successful archive
+    --force             Skip confirmation prompts
+    -h, --help          Show this help message
+
+${BOLD}WHAT HAPPENS:${NC}
+    1. Project is cleaned (node_modules, etc. removed)
+    2. Project is compressed and transferred to NAS
+    3. Metadata is saved for easy restoration
+    4. Optionally, local copy is removed
+
+${BOLD}EXAMPLES:${NC}
+    dev-archive ~/dev/old-project          # Archive a project
+    dev-archive --list                      # See what's archived
+    dev-archive --suggest                   # Get archival recommendations
+    dev-archive --stale 90                  # Find 90-day inactive projects
+
+EOF
+}
+
+# Get project metadata
+get_project_info() {
+    local project_dir=$1
+    local project_name=$(basename "$project_dir")
+
+    # Get git remote if available
+    local git_remote=""
+    if [ -d "$project_dir/.git" ]; then
+        git_remote=$(git -C "$project_dir" remote get-url origin 2>/dev/null || echo "")
+    fi
+
+    # Get last modification time
+    local last_modified=$(find "$project_dir" -type f -not -path "*/.git/*" -not -path "*/node_modules/*" -printf '%T@\n' 2>/dev/null | sort -rn | head -1)
+    local last_modified_date=""
+    if [ -n "$last_modified" ]; then
+        last_modified_date=$(date -r "${last_modified%.*}" "+%Y-%m-%d" 2>/dev/null || echo "unknown")
+    fi
+
+    # Get size
+    local size=$(du -sh "$project_dir" 2>/dev/null | cut -f1 || echo "unknown")
+
+    cat << EOF
+{
+    "name": "$project_name",
+    "original_path": "$project_dir",
+    "git_remote": "$git_remote",
+    "last_modified": "$last_modified_date",
+    "local_size": "$size",
+    "archived_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+}
+EOF
+}
+
+# List archived projects
+list_archives() {
+    print_header "Archived Projects"
+
+    if ! check_nas_ssh; then
+        log_error "Cannot connect to NAS"
+        exit 1
+    fi
+
+    local archives=$(nas_run "ls -1 '$NAS_ARCHIVE_DIR/repos/' 2>/dev/null" || echo "")
+
+    if [ -z "$archives" ]; then
+        log_info "No archived projects found"
+        return 0
+    fi
+
+    echo ""
+    printf "  ${BOLD}%-30s %-12s %-20s${NC}\n" "PROJECT" "SIZE" "ARCHIVED"
+    hr
+
+    while IFS= read -r archive; do
+        if [[ "$archive" == *.tar.gz ]]; then
+            local name="${archive%.tar.gz}"
+            local size=$(nas_run "du -sh '$NAS_ARCHIVE_DIR/repos/$archive' 2>/dev/null | cut -f1" || echo "?")
+            local date=$(nas_run "stat -c '%y' '$NAS_ARCHIVE_DIR/repos/$archive' 2>/dev/null | cut -d' ' -f1" || echo "?")
+            printf "  %-30s %-12s %-20s\n" "$name" "$size" "$date"
+        fi
+    done <<< "$archives"
+
+    echo ""
+}
+
+# Suggest projects to archive
+suggest_archives() {
+    local stale_days=${1:-60}
+    local dev_dir="$HOME/dev"
+
+    print_header "Archive Suggestions"
+
+    echo ""
+    log_info "Scanning for projects not modified in $stale_days days..."
+    echo ""
+
+    local suggestions=()
+    local total_size=0
+
+    while IFS= read -r -d '' git_dir; do
+        local project_dir=$(dirname "$git_dir")
+        local project_name=$(basename "$project_dir")
+
+        # Check if recently modified
+        local recent=$(find "$project_dir" -type f -not -path "*/.git/*" -not -path "*/node_modules/*" -mtime -"$stale_days" 2>/dev/null | head -1)
+
+        if [ -z "$recent" ]; then
+            local size=$(du -sh "$project_dir" 2>/dev/null | cut -f1 || echo "?")
+            local size_bytes=$(du -sk "$project_dir" 2>/dev/null | cut -f1 || echo 0)
+            local last_mod=$(find "$project_dir" -type f -not -path "*/.git/*" -printf '%T@\n' 2>/dev/null | sort -rn | head -1)
+            local last_date=""
+            if [ -n "$last_mod" ]; then
+                last_date=$(date -r "${last_mod%.*}" "+%Y-%m-%d" 2>/dev/null || echo "unknown")
+            fi
+
+            suggestions+=("$project_dir|$size|$last_date")
+            total_size=$((total_size + size_bytes * 1024))
+        fi
+    done < <(find "$dev_dir" -maxdepth 3 -type d -name ".git" -print0 2>/dev/null)
+
+    if [ ${#suggestions[@]} -eq 0 ]; then
+        log_success "No stale projects found! All projects are active."
+        return 0
+    fi
+
+    local total_human=$(format_bytes $total_size)
+    log_info "Found ${#suggestions[@]} inactive projects ($total_human total):"
+    echo ""
+
+    printf "  ${BOLD}%-35s %-10s %-15s${NC}\n" "PROJECT" "SIZE" "LAST MODIFIED"
+    hr
+
+    for suggestion in "${suggestions[@]}"; do
+        IFS='|' read -r path size last_date <<< "$suggestion"
+        local name=$(basename "$path")
+        printf "  %-35s %-10s %-15s\n" "$name" "$size" "$last_date"
+    done
+
+    echo ""
+    log_info "To archive a project: dev-archive /path/to/project"
+    log_info "To archive all:       dev-archive --stale $stale_days --all"
+}
+
+# Archive a single project
+archive_project() {
+    local project_dir=$1
+    local clean_local=${2:-false}
+    local force=${3:-false}
+
+    if [ ! -d "$project_dir" ]; then
+        log_error "Project directory not found: $project_dir"
+        return 1
+    fi
+
+    local project_name=$(basename "$project_dir")
+    local archive_name="${project_name}.tar.gz"
+    local nas_archive_path="$NAS_ARCHIVE_DIR/repos/$archive_name"
+
+    print_header "Archiving: $project_name"
+
+    # Check NAS connection
+    if ! check_nas_ssh; then
+        log_error "Cannot connect to NAS"
+        return 1
+    fi
+
+    # Get project info
+    local size=$(du -sh "$project_dir" 2>/dev/null | cut -f1 || echo "?")
+    local git_remote=""
+    if [ -d "$project_dir/.git" ]; then
+        git_remote=$(git -C "$project_dir" remote get-url origin 2>/dev/null || echo "none")
+    fi
+
+    echo ""
+    print_kv "Project" "$project_name"
+    print_kv "Size" "$size"
+    print_kv "Git Remote" "$git_remote"
+    print_kv "NAS Location" "$nas_archive_path"
+    echo ""
+
+    # Check if already archived
+    if nas_run "[ -f '$nas_archive_path' ]" 2>/dev/null; then
+        log_warn "Archive already exists on NAS"
+        if ! $force && ! confirm "Overwrite existing archive?"; then
+            log_info "Cancelled"
+            return 0
+        fi
+    fi
+
+    if ! $force && ! confirm "Archive this project to NAS?"; then
+        log_info "Cancelled"
+        return 0
+    fi
+
+    # Step 1: Clean the project first
+    log_step "Step 1: Cleaning project..."
+    "$SCRIPT_DIR/dev-clean" --all "$project_dir" 2>/dev/null || true
+
+    # Step 2: Create compressed archive
+    log_step "Step 2: Creating archive..."
+    local temp_archive="/tmp/${archive_name}"
+
+    # Use tar with gzip, excluding common large directories
+    tar -czf "$temp_archive" \
+        --exclude='node_modules' \
+        --exclude='.venv' \
+        --exclude='venv' \
+        --exclude='__pycache__' \
+        --exclude='.next' \
+        --exclude='dist' \
+        --exclude='build' \
+        --exclude='.turbo' \
+        -C "$(dirname "$project_dir")" \
+        "$project_name"
+
+    local archive_size=$(du -sh "$temp_archive" 2>/dev/null | cut -f1 || echo "?")
+    log_info "Compressed size: $archive_size"
+
+    # Step 3: Transfer to NAS
+    log_step "Step 3: Transferring to NAS..."
+    nas_mkdir "$NAS_ARCHIVE_DIR/repos"
+    rsync -avz --progress "$temp_archive" "$NAS_SSH_HOST:$nas_archive_path"
+
+    # Cleanup temp file
+    rm -f "$temp_archive"
+
+    # Save metadata
+    log_step "Step 4: Saving metadata..."
+    local metadata=$(get_project_info "$project_dir")
+    local metadata_path="$NAS_ARCHIVE_DIR/repos/${project_name}.json"
+    echo "$metadata" | nas_run "cat > '$metadata_path'"
+
+    # Optionally remove local copy
+    if $clean_local; then
+        log_step "Step 5: Removing local copy..."
+        rm -rf "$project_dir"
+        log_success "Local copy removed"
+    fi
+
+    echo ""
+    log_success "Project archived successfully!"
+    echo ""
+    log_info "To restore: dev-restore $project_name"
+}
+
+# Find stale projects and optionally archive all
+handle_stale() {
+    local days=$1
+    local archive_all=${2:-false}
+
+    if ! $archive_all; then
+        suggest_archives "$days"
+        return 0
+    fi
+
+    # Archive all stale projects
+    local dev_dir="$HOME/dev"
+
+    print_header "Archiving Stale Projects"
+    log_info "Finding projects not modified in $days days..."
+    echo ""
+
+    while IFS= read -r -d '' git_dir; do
+        local project_dir=$(dirname "$git_dir")
+
+        # Check if recently modified
+        local recent=$(find "$project_dir" -type f -not -path "*/.git/*" -not -path "*/node_modules/*" -mtime -"$days" 2>/dev/null | head -1)
+
+        if [ -z "$recent" ]; then
+            archive_project "$project_dir" true true
+            echo ""
+        fi
+    done < <(find "$dev_dir" -maxdepth 3 -type d -name ".git" -print0 2>/dev/null)
+
+    log_success "Stale project archival complete"
+}
+
+# Parse arguments
+CLEAN_LOCAL=false
+FORCE=false
+STALE_DAYS=0
+ARCHIVE_ALL=false
+ACTION=""
+PROJECT_PATH=""
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -l|--list)
+            ACTION="list"
+            shift
+            ;;
+        -s|--suggest)
+            ACTION="suggest"
+            shift
+            ;;
+        --stale)
+            ACTION="stale"
+            STALE_DAYS=$2
+            shift 2
+            ;;
+        --clean)
+            CLEAN_LOCAL=true
+            shift
+            ;;
+        --force)
+            FORCE=true
+            shift
+            ;;
+        --all)
+            ARCHIVE_ALL=true
+            shift
+            ;;
+        -*)
+            log_error "Unknown option: $1"
+            show_help
+            exit 1
+            ;;
+        *)
+            PROJECT_PATH=$1
+            ACTION="archive"
+            shift
+            ;;
+    esac
+done
+
+# Main
+case "$ACTION" in
+    list)
+        list_archives
+        ;;
+    suggest)
+        suggest_archives 60
+        ;;
+    stale)
+        handle_stale "$STALE_DAYS" "$ARCHIVE_ALL"
+        ;;
+    archive)
+        archive_project "$PROJECT_PATH" "$CLEAN_LOCAL" "$FORCE"
+        ;;
+    *)
+        show_help
+        ;;
+esac

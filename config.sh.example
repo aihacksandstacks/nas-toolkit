@@ -1,0 +1,46 @@
+#!/bin/bash
+# nas-toolkit configuration
+# Copy this file to config.sh and edit with your NAS settings
+#
+# cp config.sh.example config.sh
+# Then edit config.sh with your values
+
+# NAS Connection
+export NAS_HOSTNAME="your-nas-hostname"      # Friendly name for your NAS
+export NAS_IP="100.x.x.x"                    # Tailscale IP or local IP
+export NAS_USER="your-username"              # SSH username for NAS
+export NAS_SSH_HOST="nas"                    # SSH config alias (created by nas-setup)
+
+# SMB Mount Settings
+export NAS_SMB_SHARE="mac-offload"           # SMB share name on NAS
+export NAS_MOUNT_POINT="/Volumes/nas-cache"  # Local mount point
+
+# Docker
+export NAS_DOCKER_CONTEXT="nas"
+
+# NAS Mount Points (where data will be stored on NAS)
+export NAS_STORAGE_BASE="/volume1/mac-offload"  # Adjust to your NAS path
+export NAS_CACHE_DIR="${NAS_STORAGE_BASE}/caches"
+export NAS_ARCHIVE_DIR="${NAS_STORAGE_BASE}/archives"
+export NAS_DOCKER_DIR="${NAS_STORAGE_BASE}/docker"
+
+# Local paths to offload
+export LOCAL_NPM_CACHE="$HOME/.npm"
+export LOCAL_PIP_CACHE="$HOME/Library/Caches/pip"
+export LOCAL_PYPOETRY_CACHE="$HOME/Library/Caches/pypoetry"
+export LOCAL_HOMEBREW_CACHE="$HOME/Library/Caches/Homebrew"
+export LOCAL_CARGO_CACHE="$HOME/.cargo"
+export LOCAL_UV_CACHE="$HOME/.cache/uv"
+
+# Colors for output (don't change)
+export RED='\033[0;31m'
+export GREEN='\033[0;32m'
+export YELLOW='\033[1;33m'
+export BLUE='\033[0;34m'
+export PURPLE='\033[0;35m'
+export CYAN='\033[0;36m'
+export NC='\033[0m' # No Color
+export BOLD='\033[1m'
+
+# Toolkit version
+export NAS_TOOLKIT_VERSION="1.0.0"

@@ -1,0 +1,376 @@
+#!/bin/zsh
+#
+# nas-setup - Configure NAS integration for macOS development
+#
+# This script sets up:
+#   - SSH configuration for NAS access via Tailscale
+#   - Docker context pointing to NAS Docker daemon
+#   - NAS directory structure for offloaded data
+#   - Optional: Uninstall Docker Desktop
+#
+# Usage:
+#   nas-setup              # Interactive setup
+#   nas-setup --check      # Check current configuration
+#   nas-setup --docker     # Setup Docker context only
+#   nas-setup --uninstall-docker-desktop  # Remove Docker Desktop
+#
+set -e
+
+SCRIPT_DIR="${0:A:h}"
+source "$SCRIPT_DIR/../lib/common.sh"
+
+show_help() {
+    cat << EOF
+${BOLD}nas-setup${NC} - Configure NAS integration for macOS development
+
+${BOLD}USAGE:${NC}
+    nas-setup [OPTIONS]
+
+${BOLD}OPTIONS:${NC}
+    --check                     Check current NAS configuration status
+    --docker                    Setup Docker context only
+    --ssh                       Setup SSH configuration only
+    --nas-dirs                  Create NAS directory structure only
+    --uninstall-docker-desktop  Remove Docker Desktop to reclaim space
+    -h, --help                  Show this help message
+
+${BOLD}EXAMPLES:${NC}
+    nas-setup                   # Full interactive setup
+    nas-setup --check           # Verify everything is configured
+    nas-setup --docker          # Just configure Docker context
+
+${BOLD}CONFIGURATION:${NC}
+    Edit ~/dev/nas-toolkit/config.sh to change NAS settings
+
+EOF
+}
+
+check_status() {
+    print_header "NAS Toolkit Status Check"
+
+    echo ""
+    log_step "Tailscale Connection"
+    if check_nas_connection; then
+        print_kv "NAS Reachable" "Yes ($NAS_IP)" "$GREEN"
+    else
+        print_kv "NAS Reachable" "No" "$RED"
+    fi
+
+    echo ""
+    log_step "SSH Configuration"
+    if grep -q "Host $NAS_SSH_HOST" ~/.ssh/config 2>/dev/null; then
+        print_kv "SSH Config" "Present" "$GREEN"
+    else
+        print_kv "SSH Config" "Missing" "$RED"
+    fi
+
+    if check_nas_ssh 2>/dev/null; then
+        print_kv "SSH Connection" "Working" "$GREEN"
+    else
+        print_kv "SSH Connection" "Failed" "$RED"
+    fi
+
+    echo ""
+    log_step "Docker Configuration"
+    if check_docker_context 2>/dev/null; then
+        print_kv "Docker Context" "Present ($NAS_DOCKER_CONTEXT)" "$GREEN"
+    else
+        print_kv "Docker Context" "Missing" "$RED"
+    fi
+
+    local current_context=$(docker context show 2>/dev/null || echo "unknown")
+    if [ "$current_context" = "$NAS_DOCKER_CONTEXT" ]; then
+        print_kv "Active Context" "$current_context" "$GREEN"
+    else
+        print_kv "Active Context" "$current_context (not NAS)" "$YELLOW"
+    fi
+
+    echo ""
+    log_step "Docker Desktop"
+    if [ -d "$HOME/Library/Containers/com.docker.docker" ]; then
+        local dd_size=$(get_dir_size "$HOME/Library/Containers/com.docker.docker")
+        print_kv "Docker Desktop" "Installed ($dd_size)" "$YELLOW"
+        log_info "Run 'nas-setup --uninstall-docker-desktop' to reclaim space"
+    else
+        print_kv "Docker Desktop" "Not installed" "$GREEN"
+    fi
+
+    echo ""
+    log_step "NAS Directories"
+    if check_nas_ssh 2>/dev/null; then
+        if nas_dir_exists "$NAS_STORAGE_BASE" 2>/dev/null; then
+            print_kv "Storage Base" "Exists ($NAS_STORAGE_BASE)" "$GREEN"
+        else
+            print_kv "Storage Base" "Not created" "$YELLOW"
+        fi
+    else
+        print_kv "Storage Base" "Cannot check (SSH failed)" "$RED"
+    fi
+
+    echo ""
+}
+
+setup_ssh() {
+    log_step "Setting up SSH configuration"
+
+    local ssh_config="$HOME/.ssh/config"
+    local ssh_dir="$HOME/.ssh"
+
+    # Ensure .ssh directory exists
+    if [ ! -d "$ssh_dir" ]; then
+        mkdir -p "$ssh_dir"
+        chmod 700 "$ssh_dir"
+        log_success "Created $ssh_dir"
+    fi
+
+    # Check if config already has our host
+    if grep -q "Host $NAS_SSH_HOST" "$ssh_config" 2>/dev/null; then
+        log_info "SSH config for '$NAS_SSH_HOST' already exists"
+        return 0
+    fi
+
+    # Add SSH config
+    cat >> "$ssh_config" << EOF
+
+# NAS via Tailscale (added by nas-toolkit)
+Host $NAS_SSH_HOST
+    HostName $NAS_IP
+    User $NAS_USER
+    ControlMaster auto
+    ControlPath ~/.ssh/control-%C
+    ControlPersist 600
+EOF
+
+    chmod 600 "$ssh_config"
+    log_success "Added SSH config for '$NAS_SSH_HOST'"
+
+    # Test connection
+    log_info "Testing SSH connection..."
+    if ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "$NAS_SSH_HOST" "echo 'SSH connection successful'" 2>/dev/null; then
+        log_success "SSH connection works"
+    else
+        log_warn "SSH connection failed - you may need to set up SSH keys"
+        log_info "Try: ssh-copy-id $NAS_SSH_HOST"
+    fi
+}
+
+setup_docker_context() {
+    log_step "Setting up Docker context"
+
+    # Check if context already exists
+    if docker context inspect "$NAS_DOCKER_CONTEXT" &>/dev/null; then
+        log_info "Docker context '$NAS_DOCKER_CONTEXT' already exists"
+    else
+        docker context create "$NAS_DOCKER_CONTEXT" --docker "host=ssh://$NAS_SSH_HOST"
+        log_success "Created Docker context '$NAS_DOCKER_CONTEXT'"
+    fi
+
+    # Test the context
+    log_info "Testing Docker context..."
+    if docker --context "$NAS_DOCKER_CONTEXT" info &>/dev/null; then
+        log_success "Docker context works"
+
+        if confirm "Set '$NAS_DOCKER_CONTEXT' as the default Docker context?"; then
+            docker context use "$NAS_DOCKER_CONTEXT"
+            log_success "Default context set to '$NAS_DOCKER_CONTEXT'"
+        fi
+    else
+        log_error "Docker context test failed"
+        log_info "Make sure Docker is running on the NAS"
+        return 1
+    fi
+}
+
+setup_nas_directories() {
+    log_step "Creating NAS directory structure"
+
+    if ! check_nas_ssh; then
+        log_error "Cannot connect to NAS via SSH"
+        return 1
+    fi
+
+    local dirs=(
+        "$NAS_STORAGE_BASE"
+        "$NAS_CACHE_DIR"
+        "$NAS_CACHE_DIR/npm"
+        "$NAS_CACHE_DIR/pip"
+        "$NAS_CACHE_DIR/pypoetry"
+        "$NAS_CACHE_DIR/homebrew"
+        "$NAS_CACHE_DIR/cargo"
+        "$NAS_CACHE_DIR/uv"
+        "$NAS_ARCHIVE_DIR"
+        "$NAS_ARCHIVE_DIR/repos"
+    )
+
+    for dir in "${dirs[@]}"; do
+        if nas_dir_exists "$dir"; then
+            log_info "Directory exists: $dir"
+        else
+            nas_mkdir "$dir"
+            log_success "Created: $dir"
+        fi
+    done
+
+    log_success "NAS directory structure ready"
+}
+
+uninstall_docker_desktop() {
+    print_header "Docker Desktop Removal"
+
+    local dd_container="$HOME/Library/Containers/com.docker.docker"
+    local dd_app="/Applications/Docker.app"
+
+    if [ ! -d "$dd_container" ] && [ ! -d "$dd_app" ]; then
+        log_info "Docker Desktop is not installed"
+        return 0
+    fi
+
+    local dd_size=$(get_dir_size "$dd_container" 2>/dev/null || echo "unknown")
+    log_warn "This will remove Docker Desktop and reclaim approximately $dd_size"
+    echo ""
+    log_info "Your Docker images on the NAS will NOT be affected"
+    log_info "You will use 'docker --context nas' for all Docker operations"
+    echo ""
+
+    if ! confirm "Remove Docker Desktop?"; then
+        log_info "Cancelled"
+        return 0
+    fi
+
+    # Quit Docker Desktop if running
+    if pgrep -x "Docker" &>/dev/null; then
+        log_info "Stopping Docker Desktop..."
+        osascript -e 'quit app "Docker"' 2>/dev/null || true
+        sleep 3
+    fi
+
+    # Remove Docker Desktop
+    log_step "Removing Docker Desktop..."
+
+    # Remove app
+    if [ -d "$dd_app" ]; then
+        rm -rf "$dd_app"
+        log_success "Removed /Applications/Docker.app"
+    fi
+
+    # Remove container data
+    if [ -d "$dd_container" ]; then
+        rm -rf "$dd_container"
+        log_success "Removed Docker Desktop data ($dd_size)"
+    fi
+
+    # Remove other Docker Desktop files
+    local other_files=(
+        "$HOME/Library/Group Containers/group.com.docker"
+        "$HOME/Library/Application Support/Docker Desktop"
+        "$HOME/Library/Preferences/com.docker.docker.plist"
+        "$HOME/Library/Saved Application State/com.electron.docker-frontend.savedState"
+        "$HOME/Library/Logs/Docker Desktop"
+    )
+
+    for f in "${other_files[@]}"; do
+        if [ -e "$f" ]; then
+            rm -rf "$f"
+            log_info "Removed: $f"
+        fi
+    done
+
+    echo ""
+    log_success "Docker Desktop removed!"
+    log_info "Use 'docker --context nas' or set default: docker context use nas"
+}
+
+full_setup() {
+    print_header "NAS Toolkit Setup"
+
+    echo ""
+    log_info "This will configure your Mac to use NAS for:"
+    echo "  - Docker containers (via remote context)"
+    echo "  - Package caches (npm, pip, etc.)"
+    echo "  - Repository archives"
+    echo ""
+    log_info "NAS: $NAS_HOSTNAME ($NAS_IP)"
+    echo ""
+
+    if ! confirm "Continue with setup?" "y"; then
+        log_info "Setup cancelled"
+        exit 0
+    fi
+
+    echo ""
+
+    # Step 1: Check NAS connectivity
+    log_step "Step 1: Checking NAS connectivity"
+    if ! check_nas_connection; then
+        log_error "Cannot reach NAS. Make sure Tailscale is connected."
+        exit 1
+    fi
+    log_success "NAS is reachable"
+    echo ""
+
+    # Step 2: Setup SSH
+    log_step "Step 2: Configuring SSH"
+    setup_ssh
+    echo ""
+
+    # Step 3: Setup NAS directories
+    log_step "Step 3: Creating NAS directories"
+    setup_nas_directories
+    echo ""
+
+    # Step 4: Setup Docker context
+    log_step "Step 4: Configuring Docker"
+    setup_docker_context
+    echo ""
+
+    # Step 5: Offer to remove Docker Desktop
+    if [ -d "$HOME/Library/Containers/com.docker.docker" ]; then
+        echo ""
+        local dd_size=$(get_dir_size "$HOME/Library/Containers/com.docker.docker")
+        log_warn "Docker Desktop is installed and using $dd_size"
+        if confirm "Would you like to remove Docker Desktop to reclaim space?"; then
+            uninstall_docker_desktop
+        fi
+    fi
+
+    echo ""
+    print_header "Setup Complete!"
+    echo ""
+    log_success "NAS toolkit is configured"
+    echo ""
+    log_info "Next steps:"
+    echo "  1. Run 'nas-cache setup' to move package caches to NAS"
+    echo "  2. Run 'dev-clean' to clean up existing projects"
+    echo "  3. Run 'space-audit' to see current disk usage"
+    echo ""
+}
+
+# Main
+case "${1:-}" in
+    -h|--help)
+        show_help
+        ;;
+    --check)
+        check_status
+        ;;
+    --ssh)
+        setup_ssh
+        ;;
+    --docker)
+        setup_docker_context
+        ;;
+    --nas-dirs)
+        setup_nas_directories
+        ;;
+    --uninstall-docker-desktop)
+        uninstall_docker_desktop
+        ;;
+    "")
+        full_setup
+        ;;
+    *)
+        log_error "Unknown option: $1"
+        show_help
+        exit 1
+        ;;
+esac

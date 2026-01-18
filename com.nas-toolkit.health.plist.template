@@ -18,6 +18,10 @@
     <key>RunAtLoad</key>
     <true/>
 
+    <!-- Don't run jobs scheduled during sleep when waking -->
+    <key>AbandonProcessGroup</key>
+    <true/>
+
     <!-- Log output -->
     <key>StandardOutPath</key>
     <string>/tmp/nas-health.log</string>

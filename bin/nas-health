@@ -2,11 +2,87 @@
 #
 # nas-health - Check and restore NAS mount if dropped
 #
-# Run periodically via launchd to ensure NAS stays mounted
+# Run periodically via launchd to ensure NAS stays mounted.
+# Features:
+#   - Failure tracking with automatic pause after 3 failures
+#   - Rate-limited notifications (only on state changes)
+#   - Subcommands: status, resume
+#
+# Usage:
+#   nas-health          # Normal health check (run by launchd)
+#   nas-health status   # Show current health status
+#   nas-health resume   # Resume monitoring after pause
 #
 
 SCRIPT_DIR="${0:A:h}"
 source "$SCRIPT_DIR/../config.sh"
+
+STATE_DIR="$HOME/.nas-toolkit"
+STATE_FILE="$STATE_DIR/health-state"
+MAX_FAILURES=3
+
+# Initialize state directory
+mkdir -p "$STATE_DIR"
+
+# State functions
+# State format: failures:status:last_state
+# - failures: number of consecutive mount failures
+# - status: running|paused
+# - last_state: ok|failed (for notification rate-limiting)
+get_state() {
+    if [ -f "$STATE_FILE" ]; then
+        cat "$STATE_FILE"
+    else
+        echo "0:running:ok"
+    fi
+}
+
+set_state() {
+    echo "$1:$2:$3" > "$STATE_FILE"
+}
+
+# Parse current state
+IFS=':' read -r FAILURES STATUS LAST_STATE <<< "$(get_state)"
+
+# Handle subcommands
+case "$1" in
+    resume)
+        set_state 0 "running" "$LAST_STATE"
+        echo "[nas-health] Resumed monitoring"
+        # Try an immediate mount
+        if ! mount | grep -q "$NAS_MOUNT_POINT"; then
+            "$SCRIPT_DIR/nas-mount" 2>/dev/null
+        fi
+        exit 0
+        ;;
+    status)
+        echo "NAS Health Status:"
+        echo "  Consecutive failures: $FAILURES"
+        echo "  Status: $STATUS"
+        echo "  Last check: $LAST_STATE"
+        if mount | grep -q "$NAS_MOUNT_POINT"; then
+            echo "  Mount: connected at $NAS_MOUNT_POINT"
+        else
+            echo "  Mount: not connected"
+        fi
+        exit 0
+        ;;
+    help|--help|-h)
+        echo "nas-health - NAS connection health monitor"
+        echo ""
+        echo "Usage:"
+        echo "  nas-health          Normal health check (run by launchd)"
+        echo "  nas-health status   Show current health status"
+        echo "  nas-health resume   Resume monitoring after pause"
+        exit 0
+        ;;
+esac
+
+# Check if paused
+if [ "$STATUS" = "paused" ]; then
+    echo "[nas-health] Paused after $MAX_FAILURES failures. Run 'nas-health resume' to restart."
+    exit 0
+fi
 
 # Check if mount point exists
 if [ ! -d "$NAS_MOUNT_POINT" ]; then
@@ -14,21 +90,26 @@ if [ ! -d "$NAS_MOUNT_POINT" ]; then
     sudo mkdir -p "$NAS_MOUNT_POINT" 2>/dev/null
 fi
 
-# Check if mounted
+# Check if already mounted and accessible
 if mount | grep -q "$NAS_MOUNT_POINT"; then
-    # Verify it's accessible
     if [ -d "$NAS_MOUNT_POINT/caches" ]; then
+        # Successfully mounted - notify only if recovering from failure
+        if [ "$LAST_STATE" = "failed" ]; then
+            osascript -e 'display notification "NAS reconnected" with title "NAS Toolkit"' 2>/dev/null
+        fi
+        set_state 0 "running" "ok"
         echo "[nas-health] NAS mounted and accessible"
         exit 0
     else
+        # Mount exists but not accessible, unmount and retry
         echo "[nas-health] Mount exists but not accessible, remounting..."
         umount "$NAS_MOUNT_POINT" 2>/dev/null
     fi
 fi
 
-# Check if NAS is reachable
+# NAS not mounted - check if reachable
 if ! ping -c 1 -W 2 "$NAS_IP" &>/dev/null; then
-    echo "[nas-health] NAS not reachable, skipping mount"
+    echo "[nas-health] NAS not reachable at $NAS_IP, skipping mount attempt"
     exit 0
 fi
 
@@ -37,11 +118,23 @@ echo "[nas-health] Attempting to mount NAS..."
 "$SCRIPT_DIR/nas-mount" 2>/dev/null
 
 if mount | grep -q "$NAS_MOUNT_POINT"; then
+    # Success - reset failure count
+    set_state 0 "running" "ok"
     echo "[nas-health] NAS remounted successfully"
-
-    # Send notification
     osascript -e 'display notification "NAS cache remounted" with title "NAS Toolkit"' 2>/dev/null
 else
-    echo "[nas-health] Failed to remount NAS"
-    osascript -e 'display notification "Failed to remount NAS cache" with title "NAS Toolkit" sound name "Basso"' 2>/dev/null
+    # Failed - increment failure count
+    FAILURES=$((FAILURES + 1))
+
+    if [ $FAILURES -ge $MAX_FAILURES ]; then
+        # Pause after too many failures
+        set_state $FAILURES "paused" "failed"
+        echo "[nas-health] Failed $FAILURES times, pausing monitoring."
+        echo "[nas-health] Run 'nas-health resume' to restart."
+        osascript -e 'display notification "NAS mount paused after failures. Run: nas-health resume" with title "NAS Toolkit" sound name "Basso"' 2>/dev/null
+    else
+        # Just track the failure
+        set_state $FAILURES "running" "failed"
+        echo "[nas-health] Mount failed ($FAILURES/$MAX_FAILURES before pause)"
+    fi
 fi

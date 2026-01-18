@@ -1,8 +1,10 @@
 #!/bin/zsh
-# Mount NAS cache share via SMB
 #
-# Uses settings from config.sh and macOS Keychain for authentication
-# First mount via Finder (Cmd+K, smb://...) to save credentials to Keychain
+# nas-mount - Mount NAS cache share via SMB (silent, no Finder popup)
+#
+# Uses settings from config.sh and macOS Keychain for authentication.
+# First mount via Finder (Cmd+K, smb://...) to save credentials to Keychain.
+#
 
 SCRIPT_DIR="${0:A:h}"
 source "$SCRIPT_DIR/../config.sh"
@@ -19,18 +21,22 @@ if ! ping -c 1 -W 2 "$NAS_IP" &>/dev/null; then
     exit 1
 fi
 
-# Mount using Finder/Keychain (credentials stored from first manual mount)
+# Create mount point if needed
+if [ ! -d "$NAS_MOUNT_POINT" ]; then
+    echo "Creating mount point: $NAS_MOUNT_POINT"
+    sudo mkdir -p "$NAS_MOUNT_POINT"
+fi
+
 echo "Mounting NAS..."
-open "smb://${NAS_USER}@${NAS_IP}/${NAS_SMB_SHARE}"
 
-# Wait for mount to complete (up to 10 seconds)
-for i in {1..10}; do
-    sleep 1
-    if mount | grep -q "$NAS_MOUNT_POINT"; then
-        echo "Mounted successfully at $NAS_MOUNT_POINT"
-        exit 0
-    fi
-done
+# Use mount_smbfs with Keychain credentials (-N flag)
+# Credentials are stored in Keychain from first Finder mount
+/sbin/mount_smbfs -N "//${NAS_USER}@${NAS_IP}/${NAS_SMB_SHARE}" "$NAS_MOUNT_POINT" 2>&1
 
-echo "Mount timed out - check Finder for authentication prompt"
-exit 1
+if mount | grep -q "$NAS_MOUNT_POINT"; then
+    echo "Mounted successfully at $NAS_MOUNT_POINT"
+    exit 0
+else
+    echo "Mount failed - ensure credentials are in Keychain (mount via Finder first)"
+    exit 1
+fi

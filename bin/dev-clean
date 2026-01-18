@@ -24,6 +24,10 @@ CLEAN_ALL=false
 STALE_DAYS=0
 SPECIFIC_PROJECT=""
 
+# Exclusion settings
+EXCLUDE_PATTERNS=()
+EXCLUDE_FILE="$HOME/.devclean-ignore"
+
 # Patterns to clean
 CLEAN_PATTERNS=(
     "node_modules"
@@ -77,6 +81,7 @@ ${BOLD}OPTIONS:${NC}
     --all, -a           Clean all found artifacts without prompting
     --stale DAYS        Only clean projects not modified in DAYS days
     --dir PATH          Set base directory to scan (default: ~/dev)
+    --exclude PATTERN   Exclude projects matching PATTERN (can repeat)
     -h, --help          Show this help message
 
 ${BOLD}WHAT GETS CLEANED:${NC}
@@ -100,8 +105,42 @@ ${BOLD}EXAMPLES:${NC}
     dev-clean --stale 30           # Clean projects untouched for 30 days
     dev-clean ~/dev/old-project    # Clean specific project
     dev-clean --all --stale 60     # Auto-clean all stale projects
+    dev-clean --exclude my-ios-app # Exclude a project by name
+
+${BOLD}EXCLUSION FILE:${NC}
+    Create ~/.devclean-ignore with patterns to always exclude (one per line):
+
+    # Example ~/.devclean-ignore
+    my-ios-app
+    *-production
+    important-project
 
 EOF
+}
+
+# Load exclusions from config file
+load_exclusions() {
+    if [ -f "$EXCLUDE_FILE" ]; then
+        while IFS= read -r line; do
+            # Skip comments and empty lines
+            [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
+            EXCLUDE_PATTERNS+=("$line")
+        done < "$EXCLUDE_FILE"
+    fi
+}
+
+# Check if a project should be excluded
+is_excluded() {
+    local project_dir=$1
+    local project_name=$(basename "$project_dir")
+
+    for pattern in "${EXCLUDE_PATTERNS[@]}"; do
+        # Match by project name or path pattern
+        if [[ "$project_name" == $pattern ]] || [[ "$project_dir" == *"$pattern"* ]]; then
+            return 0  # excluded
+        fi
+    done
+    return 1  # not excluded
 }
 
 # Check if a project was modified within N days
@@ -233,6 +272,9 @@ scan_projects() {
     if [ "$STALE_DAYS" -gt 0 ]; then
         log_info "Only including projects not modified in $STALE_DAYS days"
     fi
+    if [ ${#EXCLUDE_PATTERNS[@]} -gt 0 ]; then
+        log_info "Excluding ${#EXCLUDE_PATTERNS[@]} pattern(s): ${EXCLUDE_PATTERNS[*]}"
+    fi
     if $DRY_RUN; then
         log_warn "DRY RUN - no files will be removed"
     fi
@@ -259,6 +301,12 @@ scan_projects() {
     local projects_cleaned=0
 
     for project in "${projects[@]}"; do
+        # Check if project is excluded
+        if is_excluded "$project"; then
+            log_info "Skipping (excluded): $(basename "$project")"
+            continue
+        fi
+
         local cleaned=$(clean_project "$project")
         if [ -n "$cleaned" ] && [ "$cleaned" -gt 0 ]; then
             total_cleaned=$((total_cleaned + cleaned))
@@ -303,6 +351,10 @@ while [[ $# -gt 0 ]]; do
             DEV_DIR=$2
             shift 2
             ;;
+        --exclude)
+            EXCLUDE_PATTERNS+=("$2")
+            shift 2
+            ;;
         -*)
             log_error "Unknown option: $1"
             show_help
@@ -314,6 +366,9 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Load exclusions from config file
+load_exclusions
 
 # Main
 if [ -n "$SPECIFIC_PROJECT" ]; then

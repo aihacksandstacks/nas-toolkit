@@ -45,3 +45,11 @@ export BOLD='\033[1m'
 
 # Toolkit version
 export NAS_TOOLKIT_VERSION="1.0.0"
+
+# Time Machine health (tm-health). Only needed if you back up to this NAS.
+export NAS_TM_SHARE_PATH="/volume1/TimeMachine"       # NAS path of the Time Machine share
+export NAS_SMB_SHARE_CONF="/etc/samba/smbshare.conf"  # Samba share config on the NAS
+export TM_MIN_FREE_GB=100          # Warn when share free space drops below this
+export TM_RECYCLE_WARN_GB=10       # Warn when the share recycle bin exceeds this
+export TM_MAX_LOCAL_SNAPSHOTS=3    # Warn when the Mac holds more local snapshots
+export TM_MAX_BACKUP_AGE_HOURS=48  # Warn when the last completed backup is older

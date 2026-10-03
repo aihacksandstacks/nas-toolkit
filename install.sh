@@ -117,6 +117,19 @@ else
     echo -e "${YELLOW}Warning: space-guard template not found, skipping watchdog setup${NC}"
 fi
 
+# Install the Time Machine health check (tm-health)
+TM_PLIST_NAME="com.nas-toolkit.tm-health.plist"
+if [ -f "$TOOLKIT_DIR/$TM_PLIST_NAME.template" ]; then
+    sed "s|__TOOLKIT_DIR__|$TOOLKIT_DIR|g" \
+        "$TOOLKIT_DIR/$TM_PLIST_NAME.template" \
+        > "$LAUNCHD_DIR/$TM_PLIST_NAME"
+
+    launchctl unload "$LAUNCHD_DIR/$TM_PLIST_NAME" 2>/dev/null || true
+    launchctl load "$LAUNCHD_DIR/$TM_PLIST_NAME"
+
+    echo -e "${GREEN}Time Machine health service installed (runs every 6 hours)${NC}"
+fi
+
 # Step 5: Create mount point if needed
 echo -e "${BLUE}[5/5]${NC} Checking mount point..."
 source "$TOOLKIT_DIR/config.sh" 2>/dev/null || true
@@ -146,6 +159,9 @@ echo "  dev-clean      - Clean project build artifacts"
 echo "  dev-archive    - Archive projects to NAS"
 echo "  dev-restore    - Restore archived projects"
 echo "  space-audit    - Analyze disk usage"
+echo "  tm-health      - Check Time Machine backups and the NAS share they use"
+echo "  snapshot-reap  - List and delete Time Machine local snapshots"
+echo "  space-guard    - Disk space and snapshot watchdog (run by launchd)"
 echo ""
 echo -e "${BOLD}Quick start:${NC}"
 echo "  1. Edit config.sh with your NAS settings"
@@ -156,4 +172,14 @@ echo -e "${BOLD}Auto-mount:${NC}"
 echo "  - NAS will be checked every 5 minutes and remounted if dropped"
 echo "  - Logs at: /tmp/nas-health.log"
 echo "  - To disable: launchctl unload ~/Library/LaunchAgents/$PLIST_NAME"
+echo ""
+echo -e "${BOLD}Disk watchdog:${NC}"
+echo "  - space-guard runs every 6 hours; notifies on low free space or piled-up snapshots"
+echo "  - Logs at: /tmp/nas-space-guard.log"
+echo "  - To disable: launchctl unload ~/Library/LaunchAgents/$GUARD_PLIST"
+echo ""
+echo -e "${BOLD}Time Machine health:${NC}"
+echo "  - Checked every 6 hours; notifies on failed backups or a full NAS share"
+echo "  - Logs at: /tmp/tm-health.log"
+echo "  - To disable: launchctl unload ~/Library/LaunchAgents/$TM_PLIST_NAME"
 echo ""

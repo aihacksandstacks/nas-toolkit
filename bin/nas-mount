@@ -21,10 +21,30 @@ if ! ping -c 1 -W 2 "$NAS_IP" &>/dev/null; then
     exit 1
 fi
 
-# Create mount point if needed
+# Create mount point if needed. Under /Volumes that takes root, and launchd
+# (nas-health) has no terminal for sudo, so fall back to letting Finder mount
+# the share: it creates /Volumes/<share> itself and uses the same Keychain
+# entry. The fallback only works when the mount point is /Volumes/<share>.
 if [ ! -d "$NAS_MOUNT_POINT" ]; then
     echo "Creating mount point: $NAS_MOUNT_POINT"
-    sudo mkdir -p "$NAS_MOUNT_POINT"
+    if ! sudo -n mkdir -p "$NAS_MOUNT_POINT" 2>/dev/null; then
+        if [ "$NAS_MOUNT_POINT" = "/Volumes/$NAS_SMB_SHARE" ]; then
+            echo "No sudo available, asking Finder to mount instead..."
+            open "smb://${NAS_USER}@${NAS_IP}/${NAS_SMB_SHARE}"
+            for _ in $(seq 1 20); do
+                mount | grep -q "$NAS_MOUNT_POINT" && break
+                sleep 1
+            done
+        else
+            echo "Cannot create $NAS_MOUNT_POINT without sudo; run: sudo mkdir -p $NAS_MOUNT_POINT"
+            exit 1
+        fi
+    fi
+fi
+
+if mount | grep -q "$NAS_MOUNT_POINT"; then
+    echo "Mounted successfully at $NAS_MOUNT_POINT"
+    exit 0
 fi
 
 echo "Mounting NAS..."

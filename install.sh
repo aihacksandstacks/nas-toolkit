@@ -102,6 +102,21 @@ else
     echo -e "${YELLOW}Warning: plist template not found, skipping auto-mount setup${NC}"
 fi
 
+# Install the disk-space + snapshot watchdog (space-guard)
+GUARD_PLIST="com.nas-toolkit.space-guard.plist"
+if [ -f "$TOOLKIT_DIR/com.nas-toolkit.space-guard.plist.template" ]; then
+    sed "s|__TOOLKIT_DIR__|$TOOLKIT_DIR|g" \
+        "$TOOLKIT_DIR/com.nas-toolkit.space-guard.plist.template" \
+        > "$LAUNCHD_DIR/$GUARD_PLIST"
+
+    launchctl unload "$LAUNCHD_DIR/$GUARD_PLIST" 2>/dev/null || true
+    launchctl load "$LAUNCHD_DIR/$GUARD_PLIST"
+
+    echo -e "${GREEN}Space-guard watchdog installed (runs every 6 hours)${NC}"
+else
+    echo -e "${YELLOW}Warning: space-guard template not found, skipping watchdog setup${NC}"
+fi
+
 # Step 5: Create mount point if needed
 echo -e "${BLUE}[5/5]${NC} Checking mount point..."
 source "$TOOLKIT_DIR/config.sh" 2>/dev/null || true

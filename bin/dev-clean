@@ -203,11 +203,13 @@ get_cleanable_size() {
 }
 
 # Clean a single project
+# All human-readable output goes to stderr; the only stdout is the final byte count
+# so the caller can capture it via $(clean_project ...).
 clean_project() {
     local project_dir=$1
     local project_name=$(basename "$project_dir")
 
-    log_step "Scanning: $project_name"
+    log_step "Scanning: $project_name" >&2
 
     # Find cleanable items
     local cleanable=()
@@ -216,7 +218,7 @@ clean_project() {
     done < <(find_cleanable "$project_dir")
 
     if [ ${#cleanable[@]} -eq 0 ]; then
-        log_info "Nothing to clean"
+        log_info "Nothing to clean" >&2
         return 0
     fi
 
@@ -224,25 +226,26 @@ clean_project() {
     local total_size=$(get_cleanable_size "${cleanable[@]}")
     local size_human=$(format_bytes $total_size)
 
-    echo ""
-    log_info "Found ${#cleanable[@]} items ($size_human):"
+    echo "" >&2
+    log_info "Found ${#cleanable[@]} items ($size_human):" >&2
 
     for item in "${cleanable[@]}"; do
         local item_size=$(du -sh "$item" 2>/dev/null | cut -f1 || echo "?")
         local rel_path="${item#$project_dir/}"
-        echo "    $rel_path ($item_size)"
+        echo "    $rel_path ($item_size)" >&2
     done
 
-    echo ""
+    echo "" >&2
 
     if $DRY_RUN; then
-        log_info "[DRY RUN] Would remove $size_human"
+        log_info "[DRY RUN] Would remove $size_human" >&2
+        echo "$total_size"
         return 0
     fi
 
     if ! $CLEAN_ALL; then
         if ! confirm "Remove these items?"; then
-            log_info "Skipped"
+            log_info "Skipped" >&2
             return 0
         fi
     fi
@@ -252,7 +255,7 @@ clean_project() {
         rm -rf "$item"
     done
 
-    log_success "Cleaned $size_human from $project_name"
+    log_success "Cleaned $size_human from $project_name" >&2
     echo "$total_size"
 }
 

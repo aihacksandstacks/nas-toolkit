@@ -1,0 +1,188 @@
+#!/bin/zsh
+#
+# snapshot-reap - List and delete Time Machine LOCAL snapshots that pin disk space
+#
+# Background:
+#   macOS keeps local Time Machine snapshots on the boot volume. They hold the
+#   *old* copy of every changed/deleted block, so they silently pin disk space
+#   and make ordinary cleanup (caches, etc.) free nothing until they're gone.
+#
+#   When the SMB/Tailscale TM destination has a stale handle, `tmutil
+#   deletelocalsnapshots` fails with `POSIXError Code=70 "Stale NFS file handle"`
+#   and a reboot does NOT clear it. The only method that works is deleting the
+#   snapshot at the raw APFS layer via `diskutil apfs deleteSnapshot`, which
+#   never touches the network destination. This script does exactly that.
+#
+# Usage:
+#   snapshot-reap                 # Dry-run: list local TM snapshots (default)
+#   snapshot-reap --older-than 3  # Only consider snapshots older than 3 days
+#   snapshot-reap --reap          # Actually delete (prompts for sudo)
+#   snapshot-reap --reap --yes    # Delete without confirmation
+#   snapshot-reap --json          # Machine-readable list (for space-guard)
+#
+set -e
+
+SCRIPT_DIR="${0:A:h}"
+source "$SCRIPT_DIR/../lib/common.sh"
+
+# The user data volume holds the TM local snapshots on modern macOS.
+DATA_VOLUME="/System/Volumes/Data"
+
+show_help() {
+    cat << EOF
+${BOLD}snapshot-reap${NC} - Delete Time Machine local snapshots that pin disk space
+
+${BOLD}USAGE:${NC}
+    snapshot-reap [OPTIONS]
+
+${BOLD}OPTIONS:${NC}
+    --older-than DAYS   Only act on snapshots older than DAYS (default: 0 = all)
+    --reap              Delete the snapshots (default is dry-run)
+    --yes, -y           Skip confirmation when reaping
+    --json              Output machine-readable list and exit
+    -h, --help          Show this help message
+
+${BOLD}WHY DISKUTIL, NOT TMUTIL:${NC}
+    A stale SMB handle to the Tailscale TM destination makes 'tmutil
+    deletelocalsnapshots' fail with Code=70 "Stale NFS file handle" — and a
+    reboot does not clear it. 'diskutil apfs deleteSnapshot' bypasses that
+    code path entirely and is the reliable fix.
+
+${BOLD}EXAMPLES:${NC}
+    snapshot-reap                      # See what's there
+    snapshot-reap --older-than 2 --reap   # Reap snapshots older than 2 days
+EOF
+}
+
+# Resolve the APFS device identifier for the Data volume (don't hardcode disk3s5).
+data_device() {
+    diskutil info "$DATA_VOLUME" 2>/dev/null \
+        | awk -F: '/Device Identifier/ {gsub(/ /,"",$2); print $2}'
+}
+
+# Emit "UUID|NAME" for each TimeMachine local snapshot on the Data volume.
+list_snapshots() {
+    diskutil apfs listSnapshots "$DATA_VOLUME" 2>/dev/null | awk '
+        /^\+-- / { uuid=$2; next }
+        /Name:/ && uuid != "" {
+            name=$2
+            if (name ~ /com\.apple\.TimeMachine\./) print uuid "|" name
+            uuid=""
+        }
+    '
+}
+
+# Extract the epoch seconds encoded in a TM snapshot name, or empty if unparseable.
+# Name form: com.apple.TimeMachine.2026-05-30-211703.backup
+snapshot_epoch() {
+    local name=$1
+    local stamp=${name#com.apple.TimeMachine.}
+    stamp=${stamp%.*}   # strip trailing .backup or .local
+    date -j -f "%Y-%m-%d-%H%M%S" "$stamp" +%s 2>/dev/null || echo ""
+}
+
+# Free space (human) on the Data volume.
+free_space() {
+    df -h "$DATA_VOLUME" 2>/dev/null | tail -1 | awk '{print $4}'
+}
+
+OLDER_THAN_DAYS=0
+DO_REAP=false
+ASSUME_YES=false
+JSON=false
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --older-than) OLDER_THAN_DAYS=$2; shift 2 ;;
+        --reap) DO_REAP=true; shift ;;
+        -y|--yes) ASSUME_YES=true; shift ;;
+        --json) JSON=true; shift ;;
+        -h|--help) show_help; exit 0 ;;
+        *) log_error "Unknown option: $1"; show_help; exit 1 ;;
+    esac
+done
+
+DEV=$(data_device)
+if [ -z "$DEV" ]; then
+    log_error "Could not resolve APFS device for $DATA_VOLUME"
+    exit 1
+fi
+
+# Cutoff epoch (snapshots strictly older than this are eligible).
+NOW=$(date +%s)
+CUTOFF=$((NOW - OLDER_THAN_DAYS * 86400))
+
+# Collect eligible snapshots into parallel arrays.
+typeset -a UUIDS NAMES AGES
+while IFS='|' read -r uuid name; do
+    [ -z "$uuid" ] && continue
+    local epoch age_days
+    epoch=$(snapshot_epoch "$name")
+    if [ -n "$epoch" ]; then
+        age_days=$(( (NOW - epoch) / 86400 ))
+        # Skip snapshots newer than the threshold.
+        [ "$epoch" -gt "$CUTOFF" ] && continue
+    else
+        age_days="?"
+    fi
+    UUIDS+=("$uuid"); NAMES+=("$name"); AGES+=("$age_days")
+done < <(list_snapshots)
+
+if $JSON; then
+    printf '{"device":"%s","free":"%s","count":%d,"snapshots":[' "$DEV" "$(free_space)" "${#UUIDS[@]}"
+    for i in {1..${#UUIDS[@]}}; do
+        [ "$i" -gt 1 ] && printf ','
+        printf '{"uuid":"%s","name":"%s","age_days":"%s"}' "${UUIDS[$i]}" "${NAMES[$i]}" "${AGES[$i]}"
+    done
+    printf ']}\n'
+    exit 0
+fi
+
+print_header "Time Machine Local Snapshots"
+echo ""
+print_kv "Data volume" "$DEV"
+print_kv "Free space" "$(free_space)"
+[ "$OLDER_THAN_DAYS" -gt 0 ] && print_kv "Filter" "older than ${OLDER_THAN_DAYS}d"
+echo ""
+
+if [ ${#UUIDS[@]} -eq 0 ]; then
+    log_success "No matching local Time Machine snapshots. Nothing to reap."
+    exit 0
+fi
+
+printf "  %-38s %-8s %s\n" "UUID" "AGE" "NAME"
+hr
+for i in {1..${#UUIDS[@]}}; do
+    printf "  %-38s %-8s %s\n" "${UUIDS[$i]}" "${AGES[$i]}d" "${NAMES[$i]}"
+done
+echo ""
+
+if ! $DO_REAP; then
+    log_info "[DRY RUN] ${#UUIDS[@]} snapshot(s) would be deleted. Re-run with --reap to delete."
+    echo -e "  ${CYAN}snapshot-reap --reap${NC}"
+    exit 0
+fi
+
+if ! $ASSUME_YES; then
+    confirm "Delete ${#UUIDS[@]} local snapshot(s) via diskutil?" "n" || { log_info "Aborted."; exit 0; }
+fi
+
+# diskutil deleteSnapshot needs root.
+SUDO=""
+if [ "$(id -u)" -ne 0 ]; then
+    SUDO="sudo"
+    log_info "Snapshot deletion requires sudo; you may be prompted for your password."
+fi
+
+REAPED=0
+for i in {1..${#UUIDS[@]}}; do
+    log_step "Deleting ${NAMES[$i]}"
+    if $SUDO diskutil apfs deleteSnapshot "$DEV" -uuid "${UUIDS[$i]}"; then
+        REAPED=$((REAPED + 1))
+    else
+        log_error "Failed to delete ${UUIDS[$i]} (continuing)"
+    fi
+done
+
+echo ""
+log_success "Reaped $REAPED/${#UUIDS[@]} snapshot(s). Free space now: $(free_space)"

@@ -1,0 +1,110 @@
+#!/bin/zsh
+#
+# space-guard - Periodic disk-space + snapshot watchdog (run by launchd)
+#
+# Fires a macOS notification when either:
+#   - free space on the data volume drops below a threshold, or
+#   - Time Machine local snapshots pile up (count or age), since those pin
+#     space and quietly block other cleanup.
+#
+# Notifications are rate-limited: it only alerts on a state CHANGE (ok->alert),
+# so you don't get pinged every run.
+#
+# Usage:
+#   space-guard          # Run a check (launchd calls this)
+#   space-guard status   # Show current readings and state
+#   space-guard --help
+#
+# Thresholds (override via env in the plist if desired):
+#   SPACE_GUARD_MIN_FREE_GB   default 20
+#   SPACE_GUARD_MAX_SNAPS     default 3
+#   SPACE_GUARD_MAX_SNAP_AGE  default 3   (days)
+#
+set -e
+
+SCRIPT_DIR="${0:A:h}"
+source "$SCRIPT_DIR/../lib/common.sh"
+
+DATA_VOLUME="/System/Volumes/Data"
+STATE_DIR="$HOME/.nas-toolkit"
+STATE_FILE="$STATE_DIR/space-guard-state"   # last_state: ok|alert
+mkdir -p "$STATE_DIR"
+
+MIN_FREE_GB=${SPACE_GUARD_MIN_FREE_GB:-20}
+MAX_SNAPS=${SPACE_GUARD_MAX_SNAPS:-3}
+MAX_SNAP_AGE=${SPACE_GUARD_MAX_SNAP_AGE:-3}
+
+# Free space on the data volume, in whole GB.
+free_gb() {
+    local kb=$(df -k "$DATA_VOLUME" 2>/dev/null | tail -1 | awk '{print $4}')
+    echo $(( kb / 1024 / 1024 ))
+}
+
+# Count of TM local snapshots.
+snap_count() {
+    diskutil apfs listSnapshots "$DATA_VOLUME" 2>/dev/null \
+        | grep -c "com.apple.TimeMachine" || echo 0
+}
+
+# Age (days) of the oldest TM local snapshot, or 0 if none/unparseable.
+oldest_snap_age() {
+    local oldest=$(diskutil apfs listSnapshots "$DATA_VOLUME" 2>/dev/null \
+        | awk '/Name:/ && /com.apple.TimeMachine/ {print $2}' | head -1)
+    [ -z "$oldest" ] && { echo 0; return; }
+    local stamp=${oldest#com.apple.TimeMachine.}
+    stamp=${stamp%.*}
+    local epoch=$(date -j -f "%Y-%m-%d-%H%M%S" "$stamp" +%s 2>/dev/null || echo "")
+    [ -z "$epoch" ] && { echo 0; return; }
+    echo $(( ( $(date +%s) - epoch ) / 86400 ))
+}
+
+get_state() { [ -f "$STATE_FILE" ] && cat "$STATE_FILE" || echo "ok"; }
+set_state() { echo "$1" > "$STATE_FILE"; }
+
+notify() {
+    osascript -e "display notification \"$1\" with title \"NAS Toolkit · Disk\" sound name \"Basso\"" 2>/dev/null || true
+}
+
+FREE=$(free_gb)
+SNAPS=$(snap_count)
+SNAP_AGE=$(oldest_snap_age)
+
+# Build the list of breached conditions.
+typeset -a reasons
+[ "$FREE" -lt "$MIN_FREE_GB" ] && reasons+=("free ${FREE}GB < ${MIN_FREE_GB}GB")
+[ "$SNAPS" -gt "$MAX_SNAPS" ] && reasons+=("${SNAPS} local snapshots")
+[ "$SNAP_AGE" -gt "$MAX_SNAP_AGE" ] && reasons+=("oldest snapshot ${SNAP_AGE}d")
+
+if [ "$1" = "status" ]; then
+    print_header "space-guard status"
+    print_kv "Free space" "${FREE}GB (min ${MIN_FREE_GB}GB)"
+    print_kv "Local snapshots" "${SNAPS} (max ${MAX_SNAPS})"
+    print_kv "Oldest snapshot" "${SNAP_AGE}d (max ${MAX_SNAP_AGE}d)"
+    print_kv "Last state" "$(get_state)"
+    [ ${#reasons[@]} -gt 0 ] && print_kv "Breached" "${(j:, :)reasons}" "$YELLOW"
+    exit 0
+fi
+
+if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+    sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+fi
+
+LAST=$(get_state)
+
+if [ ${#reasons[@]} -gt 0 ]; then
+    # Only notify on transition into alert, to avoid repeat pings.
+    if [ "$LAST" != "alert" ]; then
+        notify "$(echo "${(j:, :)reasons}"). Run snapshot-reap / dev-clean."
+    fi
+    set_state "alert"
+    echo "[space-guard] ALERT: ${(j:, :)reasons}"
+    exit 0
+fi
+
+# Recovered.
+if [ "$LAST" = "alert" ]; then
+    notify "Disk pressure cleared (${FREE}GB free)."
+fi
+set_state "ok"
+echo "[space-guard] ok: ${FREE}GB free, ${SNAPS} snapshots (oldest ${SNAP_AGE}d)"

@@ -20,19 +20,19 @@ source "$SCRIPT_DIR/../lib/common.sh"
 # Cache definitions: name|local_path|nas_subdir|description
 typeset -A CACHES
 CACHES=(
-    ["npm"]="$HOME/.npm|npm|Node.js package cache"
-    ["pip"]="$HOME/Library/Caches/pip|pip|Python pip cache"
-    ["pypoetry"]="$HOME/Library/Caches/pypoetry|pypoetry|Python Poetry cache"
-    ["homebrew"]="$HOME/Library/Caches/Homebrew|homebrew|Homebrew download cache"
-    ["cargo"]="$HOME/.cargo|cargo|Rust cargo cache"
-    ["uv"]="$HOME/.cache/uv|uv|Python uv package manager cache"
-    ["yarn"]="$HOME/.yarn/cache|yarn|Yarn package cache"
-    ["pnpm"]="$HOME/.pnpm-store|pnpm|pnpm package store"
-    ["go"]="$HOME/go/pkg/mod|go-mod|Go module cache"
-    ["gradle"]="$HOME/.gradle/caches|gradle|Gradle build cache"
-    ["maven"]="$HOME/.m2/repository|maven|Maven repository cache"
-    ["cocoapods"]="$HOME/Library/Caches/CocoaPods|cocoapods|CocoaPods cache"
-    ["playwright"]="$HOME/Library/Caches/ms-playwright|playwright|Playwright browser binaries"
+    [npm]="$HOME/.npm|npm|Node.js package cache"
+    [pip]="$HOME/Library/Caches/pip|pip|Python pip cache"
+    [pypoetry]="$HOME/Library/Caches/pypoetry|pypoetry|Python Poetry cache"
+    [homebrew]="$HOME/Library/Caches/Homebrew|homebrew|Homebrew download cache"
+    [cargo]="$HOME/.cargo|cargo|Rust cargo cache"
+    [uv]="$HOME/.cache/uv|uv|Python uv package manager cache"
+    [yarn]="$HOME/.yarn/cache|yarn|Yarn package cache"
+    [pnpm]="$HOME/.pnpm-store|pnpm|pnpm package store"
+    [go]="$HOME/go/pkg/mod|go-mod|Go module cache"
+    [gradle]="$HOME/.gradle/caches|gradle|Gradle build cache"
+    [maven]="$HOME/.m2/repository|maven|Maven repository cache"
+    [cocoapods]="$HOME/Library/Caches/CocoaPods|cocoapods|CocoaPods cache"
+    [playwright]="$HOME/Library/Caches/ms-playwright|playwright|Playwright browser binaries"
 )
 
 show_help() {
@@ -94,10 +94,10 @@ list_caches() {
     echo ""
     printf "  ${BOLD}%-15s %-45s${NC}\n" "NAME" "DESCRIPTION"
     hr
-    for cache in "${(k)CACHES}"; do
+    for cache in ${(ko)CACHES}; do
         local desc=$(get_description "$cache")
         printf "  %-15s %s\n" "$cache" "$desc"
-    done | sort
+    done
     echo ""
 }
 
@@ -115,10 +115,11 @@ show_status() {
     local total_local=0
     local total_nas=0
 
-    for cache in $(echo "${(k)CACHES}" | tr ' ' '\n' | sort); do
+    for cache in ${(ko)CACHES}; do
         local local_path=$(get_local_path "$cache")
         local nas_subdir=$(get_nas_subdir "$cache")
         local nas_path="$NAS_CACHE_DIR/$nas_subdir"
+        local mount_path="${nas_path/#$NAS_STORAGE_BASE/$NAS_MOUNT_POINT}"
 
         local size="0"
         local location="-"
@@ -127,7 +128,7 @@ show_status() {
         if [ -L "$local_path" ]; then
             # It's a symlink
             local target=$(readlink "$local_path")
-            if [[ "$target" == *"$NAS_STORAGE_BASE"* ]] || [[ "$target" == "/volume"* ]]; then
+            if [[ "$target" == "$NAS_MOUNT_POINT"* ]]; then
                 location="NAS"
                 cache_status="${GREEN}Symlinked${NC}"
                 # Get size from NAS if possible
@@ -175,6 +176,7 @@ move_cache() {
     local local_path=$(get_local_path "$cache")
     local nas_subdir=$(get_nas_subdir "$cache")
     local nas_path="$NAS_CACHE_DIR/$nas_subdir"
+    local mount_path="${nas_path/#$NAS_STORAGE_BASE/$NAS_MOUNT_POINT}"
     local desc=$(get_description "$cache")
 
     log_step "Moving $cache cache to NAS"
@@ -195,7 +197,7 @@ move_cache() {
         if confirm "Create symlink to NAS anyway (for future use)?"; then
             nas_mkdir "$nas_path"
             mkdir -p "$(dirname "$local_path")"
-            ln -s "$nas_path" "$local_path"
+            ln -s "$mount_path" "$local_path"
             log_success "Created symlink for future use"
         fi
         return 0
@@ -247,7 +249,7 @@ move_cache() {
     rm -rf "$local_path"
 
     log_info "Creating symlink..."
-    ln -s "$nas_path" "$local_path"
+    ln -s "$mount_path" "$local_path"
 
     log_success "$cache moved to NAS and symlinked"
 }
@@ -263,6 +265,7 @@ restore_cache() {
     local local_path=$(get_local_path "$cache")
     local nas_subdir=$(get_nas_subdir "$cache")
     local nas_path="$NAS_CACHE_DIR/$nas_subdir"
+    local mount_path="${nas_path/#$NAS_STORAGE_BASE/$NAS_MOUNT_POINT}"
 
     log_step "Restoring $cache cache to local"
 
@@ -305,7 +308,7 @@ verify_symlinks() {
 
     local all_ok=true
 
-    for cache in $(echo "${(k)CACHES}" | tr ' ' '\n' | sort); do
+    for cache in ${(ko)CACHES}; do
         local local_path=$(get_local_path "$cache")
 
         if [ -L "$local_path" ]; then
@@ -344,7 +347,7 @@ interactive_setup() {
     local caches_to_move=()
     local total_size=0
 
-    for cache in $(echo "${(k)CACHES}" | tr ' ' '\n' | sort); do
+    for cache in ${(ko)CACHES}; do
         local local_path=$(get_local_path "$cache")
         if [ -d "$local_path" ] && [ ! -L "$local_path" ]; then
             local size_bytes=$(get_dir_size_bytes "$local_path")

@@ -23,6 +23,9 @@ nas-setup --uninstall-docker-desktop
 ## Daily Commands
 
 ```bash
+# Check Time Machine + the NAS share it backs up to
+tm-health
+
 # Check disk status
 space-audit --quick
 

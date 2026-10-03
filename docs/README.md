@@ -151,6 +151,23 @@ space-audit --caches   # Focus on caches
 space-audit --docker   # Focus on Docker
 ```
 
+### `tm-health`
+Check Time Machine from both ends: the Mac's last backup result and local
+snapshots, and the NAS share it backs up to (quota-aware free space, recycle
+bin size, sparsebundle bloat). Installed as a launchd job that runs every 6
+hours and sends a notification when something needs attention.
+```bash
+tm-health            # Report, exit 1 if anything is in WARN state
+tm-health --notify   # Same, plus a macOS notification on state change
+```
+Thresholds live in `config.sh` (`TM_MIN_FREE_GB`, `TM_RECYCLE_WARN_GB`,
+`TM_MAX_LOCAL_SNAPSHOTS`, `TM_MAX_BACKUP_AGE_HOURS`).
+
+```bash
+tm-health install-purge   # Hourly root cron on the NAS that empties the share's #recycle
+tm-health remove-purge    # Remove it again
+```
+
 ## Configuration
 
 Edit `~/dev/nas-toolkit/config.sh` to customize:
@@ -233,6 +250,72 @@ docker compose up -d
 Your Mac just sends commands over SSH. Images, containers, and volumes all live on the NAS.
 
 ## Troubleshooting
+
+### Time Machine: "not enough space on the backup disk even after older backups were deleted"
+The Mac's `hdiutil info` shows the sparsebundle as a 16 TB image and the NAS
+volume has terabytes free, so the message looks wrong. It isn't. Time Machine
+sees the share's quota, and two things eat that quota silently:
+
+1. **The share's SMB recycle bin.** Time Machine thins old backups by deleting
+   sparsebundle band files. With the recycle bin on, every deleted band moves
+   to `#recycle` and still counts against the quota. On 2026-09-24 that folder
+   held 304 GB of dead bands.
+2. **Sparsebundle slack.** Bands never shrink on their own. The image sat at
+   1.1 TB on disk for 655 GB of actual backup data.
+
+Diagnose (this is what `tm-health` automates):
+```bash
+ssh nas 'repquota -P /volume1; df -h /volume1/TimeMachine; du -sh "/volume1/TimeMachine/#recycle"'
+```
+
+Fix, in order:
+```bash
+# 1. Empty the recycle bin (only ever holds deleted band files on this share)
+ssh nas 'rm -rf "/volume1/TimeMachine/#recycle"/* "/volume1/TimeMachine/#recycle"/.[!.]*'
+
+# 2. Stop the bin from refilling. UGOS does not expose a recycle bin toggle
+#    for the Time Machine share, so install an hourly purge cron on the NAS
+#    instead (idempotent; remove with `tm-health remove-purge`). It skips
+#    files younger than 2 hours, and silly-renamed ".smbdelete*" files younger
+#    than a day, because deleting a file the Mac still has open aborts the
+#    running backup.
+tm-health install-purge
+
+# 3. Optional: raise the share quota in the same screen if the volume has room.
+
+# 4. Kick a backup and watch it
+tmutil startbackup
+tmutil status
+```
+
+Freed space not showing up while a backup runs? Time Machine takes a local
+APFS snapshot when a backup starts, and anything deleted after that stays
+pinned until the snapshot goes. `tmutil stopbackup`, then
+`tmutil deletelocalsnapshots <date>` (works without sudo once the backup is
+idle), then `tmutil startbackup`. On 2026-10-02 that released 105 GB.
+
+Leftovers worth cleaning once backups work again:
+
+- **Orphaned `.previous` / `.interrupted` backups inside the image.** backupd
+  logs `fBsyErr: File is busy (delete)` for these and never finishes removing
+  them. Needs a Terminal with Full Disk Access, while the backup volume is
+  mounted and no backup is running:
+  ```bash
+  sudo tmutil disable
+  ls -d "/Volumes/Backups of <your Mac>/"*.previous "/Volumes/Backups of <your Mac>/"*.interrupted
+  sudo rm -rf "/Volumes/Backups of <your Mac>/"*.previous "/Volumes/Backups of <your Mac>/"*.interrupted
+  sudo tmutil enable
+  ```
+- **Sparsebundle slack.** Reclaim it with `hdiutil compact`. Do this only after
+  the recycle bin is off, or the freed bands go straight back into it.
+  ```bash
+  sudo tmutil disable                      # backupd unmounts the image
+  open "smb://$NAS_IP/TimeMachine"        # mount the share in Finder
+  hdiutil compact "/Volumes/TimeMachine/<your Mac>.sparsebundle"  # prompts for the image password
+  sudo tmutil enable
+  ```
+  Expect it to take a while over Tailscale; it rewrites band metadata for the
+  whole image.
 
 ### NAS not reachable
 ```bash

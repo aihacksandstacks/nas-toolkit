@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.nas-toolkit.tm-health</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__TOOLKIT_DIR__/bin/tm-health</string>
+        <string>--notify</string>
+    </array>
+
+    <!-- Run every 6 hours -->
+    <key>StartInterval</key>
+    <integer>21600</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>AbandonProcessGroup</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/tm-health.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/tm-health.log</string>
+</dict>
+</plist>

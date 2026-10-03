@@ -151,6 +151,25 @@ space-audit --caches   # Focus on caches
 space-audit --docker   # Focus on Docker
 ```
 
+### `snapshot-reap`
+List and delete Time Machine local snapshots, which pin deleted blocks and make
+other cleanup free nothing. Deletes through `diskutil apfs deleteSnapshot`,
+which still works when `tmutil deletelocalsnapshots` fails with
+`Stale NFS file handle` against a network destination.
+```bash
+snapshot-reap                        # Dry run: list local snapshots
+snapshot-reap --older-than 2 --reap  # Delete snapshots older than 2 days (sudo)
+snapshot-reap --json                 # Machine-readable list
+```
+
+### `space-guard`
+Watchdog installed as a launchd job (every 6 hours). Sends one notification
+when free space drops below 20 GB or local snapshots pile up, and one when it
+clears. Thresholds are environment variables in the plist template.
+```bash
+space-guard status   # Current readings and last state
+```
+
 ### `tm-health`
 Check Time Machine from both ends: the Mac's last backup result and local
 snapshots, and the NAS share it backs up to (quota-aware free space, recycle

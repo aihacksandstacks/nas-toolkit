@@ -132,7 +132,7 @@ confirm() {
         local prompt="[y/N]"
     fi
 
-    echo -n "${YELLOW}$message${NC} $prompt "
+    echo -n "${YELLOW}$message${NC} $prompt " >&2
     read response
     response=${response:-$default}
 

@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.nas-toolkit.space-guard</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__TOOLKIT_DIR__/bin/space-guard</string>
+    </array>
+
+    <!-- Thresholds (edit to taste) -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>SPACE_GUARD_MIN_FREE_GB</key>
+        <string>20</string>
+        <key>SPACE_GUARD_MAX_SNAPS</key>
+        <string>3</string>
+        <key>SPACE_GUARD_MAX_SNAP_AGE</key>
+        <string>3</string>
+    </dict>
+
+    <!-- Run every 6 hours (21600 seconds) -->
+    <key>StartInterval</key>
+    <integer>21600</integer>
+
+    <!-- Run at login/load -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Don't run jobs scheduled during sleep when waking -->
+    <key>AbandonProcessGroup</key>
+    <true/>
+
+    <!-- Log output -->
+    <key>StandardOutPath</key>
+    <string>/tmp/nas-space-guard.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/nas-space-guard.log</string>
+</dict>
+</plist>

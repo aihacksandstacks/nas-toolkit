@@ -26,6 +26,10 @@ nas-setup --uninstall-docker-desktop
 # Check Time Machine + the NAS share it backs up to
 tm-health
 
+# Free space pinned by Time Machine local snapshots
+snapshot-reap            # list
+snapshot-reap --reap     # delete (sudo)
+
 # Check disk status
 space-audit --quick
 

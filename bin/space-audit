@@ -48,13 +48,18 @@ ${BOLD}EXAMPLES:${NC}
 EOF
 }
 
+# On modern macOS the user data lives on /System/Volumes/Data; / is read-only system.
+df_target() {
+    [ -d "/System/Volumes/Data" ] && echo "/System/Volumes/Data" || echo "/"
+}
+
 # Get disk overview
 audit_disk_overview() {
     log_step "Disk Overview"
     echo ""
 
     # Get disk info
-    local disk_info=$(df -h / | tail -1)
+    local disk_info=$(df -h "$(df_target)" | tail -1)
     local total=$(echo "$disk_info" | awk '{print $2}')
     local used=$(echo "$disk_info" | awk '{print $3}')
     local avail=$(echo "$disk_info" | awk '{print $4}')
@@ -138,20 +143,20 @@ audit_caches() {
     hr
 
     for cache in npm pip pypoetry homebrew cargo uv yarn pnpm playwright; do
-        local path="${cache_paths[$cache]}"
+        local cache_path="${cache_paths[$cache]}"
         local size="0"
         local location="-"
         local color=$NC
 
-        if [ -L "$path" ]; then
+        if [ -L "$cache_path" ]; then
             location="NAS"
             color=$GREEN
             size="(NAS)"
-        elif [ -d "$path" ]; then
-            size=$(du -sh "$path" 2>/dev/null | cut -f1 || echo "?")
+        elif [ -d "$cache_path" ]; then
+            size=$(du -sh "$cache_path" 2>/dev/null | cut -f1 || echo "?")
             location="Local"
             color=$YELLOW
-            local size_bytes=$(du -sk "$path" 2>/dev/null | cut -f1 || echo 0)
+            local size_bytes=$(du -sk "$cache_path" 2>/dev/null | cut -f1 || echo 0)
             total_local=$((total_local + size_bytes * 1024))
         fi
 
@@ -245,6 +250,41 @@ audit_dev() {
     echo ""
 }
 
+# Audit Time Machine local snapshots (a recurring space-pinning culprit)
+audit_snapshots() {
+    log_step "Time Machine Local Snapshots"
+    echo ""
+
+    local data_volume="/System/Volumes/Data"
+    # Names + dates of TM local snapshots on the Data volume.
+    local snaps=$(diskutil apfs listSnapshots "$data_volume" 2>/dev/null \
+        | awk '/Name:/ && /com.apple.TimeMachine/ {print $2}')
+
+    if [ -z "$snaps" ]; then
+        print_kv "Local snapshots" "none" "$GREEN"
+        echo ""
+        return 0
+    fi
+
+    local count=$(echo "$snaps" | wc -l | tr -d ' ')
+    local oldest=$(echo "$snaps" | head -1)
+    # Age of the oldest snapshot in days, if parseable.
+    local stamp=${oldest#com.apple.TimeMachine.}
+    stamp=${stamp%.*}
+    local epoch=$(date -j -f "%Y-%m-%d-%H%M%S" "$stamp" +%s 2>/dev/null || echo "")
+    local age="?"
+    [ -n "$epoch" ] && age="$(( ( $(date +%s) - epoch ) / 86400 ))d"
+
+    local color=$GREEN
+    [ "$count" -gt 2 ] && color=$YELLOW
+
+    print_kv "Local snapshots" "$count (oldest ${age})" "$color"
+    echo ""
+    echo -e "  ${CYAN}Local snapshots pin deleted/changed blocks and block other cleanup.${NC}"
+    echo -e "  ${CYAN}Recommendation: Run 'snapshot-reap' to inspect, 'snapshot-reap --reap' to clear${NC}"
+    echo ""
+}
+
 # Generate recommendations
 generate_recommendations() {
     print_header "Recommendations"
@@ -252,6 +292,13 @@ generate_recommendations() {
 
     local total_recoverable=0
     local recommendations=()
+
+    # Check Time Machine local snapshots (pin space + block other cleanup)
+    local snap_count=$(diskutil apfs listSnapshots "/System/Volumes/Data" 2>/dev/null \
+        | grep -c "com.apple.TimeMachine" || echo 0)
+    if [ "$snap_count" -gt 2 ]; then
+        recommendations+=("0|$snap_count snaps|Clear Time Machine local snapshots|snapshot-reap --reap")
+    fi
 
     # Check Docker Desktop
     local dd_path="$HOME/Library/Containers/com.docker.docker"
@@ -270,10 +317,10 @@ generate_recommendations() {
     )
 
     local cache_total=0
-    for cache in "${!cache_paths[@]}"; do
-        local path="${cache_paths[$cache]}"
-        if [ -d "$path" ] && [ ! -L "$path" ]; then
-            local size_bytes=$(du -sk "$path" 2>/dev/null | cut -f1 || echo 0)
+    for cache in "${(k)cache_paths[@]}"; do
+        local cache_path="${cache_paths[$cache]}"
+        if [ -d "$cache_path" ] && [ ! -L "$cache_path" ]; then
+            local size_bytes=$(du -sk "$cache_path" 2>/dev/null | cut -f1 || echo 0)
             cache_total=$((cache_total + size_bytes * 1024))
         fi
     done
@@ -324,7 +371,7 @@ quick_audit() {
     echo ""
 
     # Disk overview
-    local disk_info=$(df -h / | tail -1)
+    local disk_info=$(df -h "$(df_target)" | tail -1)
     local used=$(echo "$disk_info" | awk '{print $3}')
     local avail=$(echo "$disk_info" | awk '{print $4}')
     local pct=$(echo "$disk_info" | awk '{print $5}')
@@ -352,6 +399,7 @@ full_audit() {
     print_header "Full Space Audit"
 
     audit_disk_overview
+    audit_snapshots
     audit_docker
     audit_caches
     audit_system_caches

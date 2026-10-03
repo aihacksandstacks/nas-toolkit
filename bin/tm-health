@@ -1,0 +1,280 @@
+#!/bin/zsh
+#
+# tm-health - Time Machine backup health check (Mac side + NAS share side)
+#
+# Catches the failure modes that make Time Machine report "not enough space
+# even after older backups were deleted" when backing up to a NAS SMB share:
+#   - share quota nearly full (the Mac sees the quota, not the NAS volume)
+#   - SMB recycle bin hoarding deleted sparsebundle bands
+#   - sparsebundle bloated far beyond what the backup volume actually uses
+#   - last backup failed, or local snapshots piling up on the Mac
+#
+# Usage:
+#   tm-health                 # Print report, exit 1 if anything is in WARN state
+#   tm-health --notify        # Same, plus a macOS notification on state change
+#                             # (used by launchd; runs every 6 hours)
+#   tm-health install-purge   # Install an hourly root cron job on the NAS that
+#                             # empties the share's #recycle folder. Use this when
+#                             # the NAS UI offers no way to disable the recycle
+#                             # bin for the Time Machine share.
+#   tm-health remove-purge    # Remove that cron job again
+#
+# Configuration (config.sh, all optional):
+#   NAS_TM_SHARE_PATH        NAS path of the Time Machine share
+#   NAS_SMB_SHARE_CONF       Samba share config on the NAS (to detect recycle bin)
+#   TM_MIN_FREE_GB           Warn when share free space drops below this
+#   TM_RECYCLE_WARN_GB       Warn when the share recycle bin exceeds this
+#   TM_MAX_LOCAL_SNAPSHOTS   Warn when the Mac holds more local snapshots
+#   TM_MAX_BACKUP_AGE_HOURS  Warn when the last completed backup is older
+#
+
+SCRIPT_DIR="${0:A:h}"
+source "$SCRIPT_DIR/../lib/common.sh"
+
+NAS_TM_SHARE_PATH="${NAS_TM_SHARE_PATH:-/volume1/TimeMachine}"
+NAS_SMB_SHARE_CONF="${NAS_SMB_SHARE_CONF:-/etc/samba/smbshare.conf}"
+TM_MIN_FREE_GB="${TM_MIN_FREE_GB:-100}"
+TM_RECYCLE_WARN_GB="${TM_RECYCLE_WARN_GB:-10}"
+TM_MAX_LOCAL_SNAPSHOTS="${TM_MAX_LOCAL_SNAPSHOTS:-3}"
+TM_MAX_BACKUP_AGE_HOURS="${TM_MAX_BACKUP_AGE_HOURS:-48}"
+
+STATE_DIR="$HOME/.nas-toolkit"
+STATE_FILE="$STATE_DIR/tm-health-state"
+TM_PREFS="/Library/Preferences/com.apple.TimeMachine"
+
+# Cron entry installed on the NAS by `install-purge`. The marker comment makes
+# install/remove idempotent. The recycle folder on a Time Machine share only
+# ever holds files Time Machine already deleted, but macOS silly-renames files
+# it deletes while they are still open (".smbdelete*"), and the recycle VFS
+# moves those too. Deleting one from under an open handle can abort a running
+# backup, so the job leaves anything recent alone: 2 hours for normal files,
+# a day for silly-renamed ones. Empty directories left by keeptree are pruned.
+PURGE_MARKER="# nas-toolkit tm-health: purge Time Machine share recycle bin"
+PURGE_JOB="0 * * * * R='$NAS_TM_SHARE_PATH/#recycle'; [ -d \"\$R\" ] && { find \"\$R\" -mindepth 1 -type f ! -name '*smbdelete*' -mmin +120 -delete; find \"\$R\" -mindepth 1 -type f -name '*smbdelete*' -mtime +1 -delete; find \"\$R\" -mindepth 1 -type d -empty -delete; } 2>/dev/null"
+
+install_purge() {
+    check_nas_ssh || return 1
+    # The job line goes over stdin so the remote shell never re-parses its
+    # quotes or expands its variables.
+    printf '%s\n' "$PURGE_MARKER" "$PURGE_JOB" | ssh -o BatchMode=yes "$NAS_SSH_HOST" "
+        ( crontab -l 2>/dev/null | grep -vF '$PURGE_MARKER' | grep -vF \"$NAS_TM_SHARE_PATH/#recycle\"; cat ) | crontab -
+        crontab -l | grep -A1 -F '$PURGE_MARKER'
+    " || { log_error "Failed to install cron job on $NAS_SSH_HOST"; return 1; }
+    log_success "Hourly recycle bin purge installed on $NAS_SSH_HOST for $NAS_TM_SHARE_PATH"
+}
+
+remove_purge() {
+    check_nas_ssh || return 1
+    ssh -o BatchMode=yes "$NAS_SSH_HOST" "
+        crontab -l 2>/dev/null | grep -vF '$PURGE_MARKER' | grep -vF \"$NAS_TM_SHARE_PATH/#recycle\" | crontab -
+    " || { log_error "Failed to update crontab on $NAS_SSH_HOST"; return 1; }
+    log_success "Recycle bin purge job removed from $NAS_SSH_HOST"
+}
+
+NOTIFY=0
+case "$1" in
+    --notify) NOTIFY=1 ;;
+    install-purge)
+        if [ "$2" = "--dry-run" ]; then
+            echo "Would add to root's crontab on $NAS_SSH_HOST:"
+            echo "$PURGE_MARKER"
+            echo "$PURGE_JOB"
+            exit 0
+        fi
+        install_purge; exit $?
+        ;;
+    remove-purge) remove_purge; exit $? ;;
+    help|--help|-h)
+        awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"
+        exit 0
+        ;;
+esac
+
+mkdir -p "$STATE_DIR"
+
+typeset -a WARNINGS
+warn() {
+    WARNINGS+=("$1")
+    log_warn "$1"
+}
+
+kb_to_gb() {
+    awk -v kb="$1" 'BEGIN { printf "%.1f", kb / 1048576 }'
+}
+
+bytes_to_gb() {
+    awk -v b="$1" 'BEGIN { printf "%.1f", b / 1073741824 }'
+}
+
+# Read one key from the Time Machine prefs plist. Works without Full Disk Access.
+tm_pref() {
+    defaults read "$TM_PREFS" 2>/dev/null | grep -m1 -E "^\s*$1 = " | sed -E 's/.*= "?([^";]*)"?;/\1/'
+}
+
+# ---------------------------------------------------------------------------
+print_header "Time Machine: Mac side"
+
+DEST_URL=$(tmutil destinationinfo 2>/dev/null | grep -m1 '^URL' | sed 's/^URL *: *//')
+if [ -z "$DEST_URL" ]; then
+    warn "No Time Machine destination configured"
+else
+    print_kv "Destination" "$DEST_URL"
+fi
+
+RUNNING=$(tmutil status 2>/dev/null | grep -m1 'Running' | tr -dc '0-9')
+PHASE=$(tmutil status 2>/dev/null | grep -m1 'BackupPhase' | sed -E 's/.*= (.*);/\1/')
+if [ "$RUNNING" = "1" ]; then
+    print_kv "Backup" "running (${PHASE:-unknown phase})" "$CYAN"
+else
+    print_kv "Backup" "idle"
+fi
+
+# RESULT is the code of the last backup attempt. 0 = success,
+# 7 = BACKUP_FAILED_DISK_FULL_AFTER_THINNING.
+LAST_RESULT=$(tm_pref RESULT)
+LAST_ACTIVITY=$(tm_pref LastBackupActivity)
+# RESULT is rewritten while a backup runs, so only judge it when idle.
+if [ "$RUNNING" = "1" ]; then
+    print_kv "Last attempt" "in progress (previous result code ${LAST_RESULT:-unknown})"
+else
+    case "$LAST_RESULT" in
+        0)  print_kv "Last attempt" "succeeded ($LAST_ACTIVITY)" "$GREEN" ;;
+        "") print_kv "Last attempt" "unknown" ;;
+        7)  warn "Last backup failed: destination full after thinning (code 7) at $LAST_ACTIVITY" ;;
+        *)  warn "Last backup failed with code $LAST_RESULT at $LAST_ACTIVITY" ;;
+    esac
+fi
+
+# tmutil latestbackup needs Full Disk Access for the calling shell. Use it when
+# available; otherwise the RESULT code above is the best signal we have.
+LATEST=$(tmutil latestbackup -t 2>/dev/null)
+if [ -n "$LATEST" ]; then
+    LATEST_EPOCH=$(date -j -f '%Y-%m-%d-%H%M%S' "$LATEST" '+%s' 2>/dev/null)
+    if [ -n "$LATEST_EPOCH" ]; then
+        AGE_HOURS=$(( ( $(date +%s) - LATEST_EPOCH ) / 3600 ))
+        if [ "$AGE_HOURS" -gt "$TM_MAX_BACKUP_AGE_HOURS" ]; then
+            warn "Last completed backup is ${AGE_HOURS}h old ($LATEST)"
+        else
+            print_kv "Last completed" "$LATEST (${AGE_HOURS}h ago)" "$GREEN"
+        fi
+    fi
+else
+    print_kv "Last completed" "unavailable (grant Full Disk Access to see it)"
+fi
+
+DEST_USED=$(tm_pref BytesUsed)
+DEST_AVAIL=$(tm_pref BytesAvailable)
+if [ -n "$DEST_USED" ]; then
+    print_kv "Backup volume used" "$(bytes_to_gb "$DEST_USED") GB"
+    print_kv "Backup volume free" "$(bytes_to_gb "$DEST_AVAIL") GB (as last seen by Time Machine)"
+fi
+
+SNAPSHOTS=("${(@f)$(tmutil listlocalsnapshots / 2>/dev/null | grep 'com.apple.TimeMachine')}")
+SNAP_COUNT=${#SNAPSHOTS[@]}
+[ -z "${SNAPSHOTS[1]}" ] && SNAP_COUNT=0
+if [ "$SNAP_COUNT" -gt "$TM_MAX_LOCAL_SNAPSHOTS" ]; then
+    warn "$SNAP_COUNT local snapshots on the Mac (limit $TM_MAX_LOCAL_SNAPSHOTS); they pin disk space until a backup completes"
+else
+    print_kv "Local snapshots" "$SNAP_COUNT"
+fi
+
+# ---------------------------------------------------------------------------
+print_header "Time Machine: NAS share ($NAS_TM_SHARE_PATH)"
+
+if ! ssh -o BatchMode=yes -o ConnectTimeout=5 "$NAS_SSH_HOST" true 2>/dev/null; then
+    warn "Cannot SSH to NAS ($NAS_SSH_HOST); share checks skipped"
+else
+    # One SSH round trip. df on the share path reports the share's project quota
+    # on UGOS/Synology, which is the number Time Machine actually sees.
+    REMOTE=$(ssh -o BatchMode=yes "$NAS_SSH_HOST" "
+        df -Pk '$NAS_TM_SHARE_PATH' | awk 'NR==2 {print \"DF\", \$2, \$3, \$4}'
+        du -sk '$NAS_TM_SHARE_PATH/#recycle' 2>/dev/null | awk '{print \"RECYCLE\", \$1}'
+        for b in '$NAS_TM_SHARE_PATH'/*.sparsebundle; do
+            [ -d \"\$b\" ] && du -sk \"\$b\" | awk -F'\t' -v n=\"\$(basename \"\$b\")\" '{print \"BUNDLE\t\" \$1 \"\t\" n}'
+        done
+        crontab -l 2>/dev/null | grep -qF '$PURGE_MARKER' && echo PURGE_ON
+        if [ -r '$NAS_SMB_SHARE_CONF' ]; then
+            awk -v p='$NAS_TM_SHARE_PATH' '
+                /^\[/ { insec=0 }
+                \$1==\"path\" && \$3==p { insec=1 }
+                insec && /recycle:repository/ { print \"RECYCLE_ON\" }
+            ' '$NAS_SMB_SHARE_CONF'
+        fi
+    " 2>/dev/null)
+
+    SHARE_SIZE_KB=$(echo "$REMOTE" | awk '$1=="DF" {print $2}')
+    SHARE_USED_KB=$(echo "$REMOTE" | awk '$1=="DF" {print $3}')
+    SHARE_FREE_KB=$(echo "$REMOTE" | awk '$1=="DF" {print $4}')
+    RECYCLE_KB=$(echo "$REMOTE" | awk '$1=="RECYCLE" {print $2}')
+    RECYCLE_ON=$(echo "$REMOTE" | grep -c '^RECYCLE_ON$')
+
+    if [ -z "$SHARE_SIZE_KB" ]; then
+        warn "Could not read share usage on the NAS at $NAS_TM_SHARE_PATH"
+    else
+        SHARE_FREE_GB=$(kb_to_gb "$SHARE_FREE_KB")
+        print_kv "Share size" "$(kb_to_gb "$SHARE_SIZE_KB") GB (quota-aware)"
+        print_kv "Share used" "$(kb_to_gb "$SHARE_USED_KB") GB"
+        if awk -v f="$SHARE_FREE_GB" -v m="$TM_MIN_FREE_GB" 'BEGIN { exit !(f < m) }'; then
+            warn "Share has only ${SHARE_FREE_GB} GB free (minimum $TM_MIN_FREE_GB). Empty the recycle bin or raise the share quota."
+        else
+            print_kv "Share free" "${SHARE_FREE_GB} GB" "$GREEN"
+        fi
+    fi
+
+    if [ -n "$RECYCLE_KB" ]; then
+        RECYCLE_GB=$(kb_to_gb "$RECYCLE_KB")
+        if awk -v r="$RECYCLE_GB" -v m="$TM_RECYCLE_WARN_GB" 'BEGIN { exit !(r > m) }'; then
+            warn "Share recycle bin holds ${RECYCLE_GB} GB of deleted backup bands. Run: ssh $NAS_SSH_HOST 'rm -rf \"$NAS_TM_SHARE_PATH/#recycle\"/*'"
+        else
+            print_kv "Recycle bin" "${RECYCLE_GB} GB"
+        fi
+    fi
+    if [ "$RECYCLE_ON" -gt 0 ]; then
+        PURGE_INSTALLED=$(echo "$REMOTE" | grep -c '^PURGE_ON$')
+        if [ "$PURGE_INSTALLED" -gt 0 ]; then
+            print_kv "Recycle bin" "enabled on share, hourly purge cron installed"
+        else
+            warn "Recycle bin is enabled on the Time Machine share and nothing purges it. Disable it in the NAS share settings, or run: tm-health install-purge"
+        fi
+    fi
+
+    echo "$REMOTE" | awk -F'\t' '$1=="BUNDLE" {print $2 "\t" $3}' | while IFS=$'\t' read -r bundle_kb bundle_name; do
+        BUNDLE_GB=$(kb_to_gb "$bundle_kb")
+        if [ -n "$DEST_USED" ]; then
+            USED_GB=$(bytes_to_gb "$DEST_USED")
+            print_kv "$bundle_name" "${BUNDLE_GB} GB on disk, ${USED_GB} GB used inside"
+            # Sparsebundle bands never shrink on their own. Flag when the image
+            # is carrying more than 25% slack; hdiutil compact reclaims it.
+            if awk -v b="$BUNDLE_GB" -v u="$USED_GB" 'BEGIN { exit !(u > 0 && b > u * 1.25) }'; then
+                log_info "  $(awk -v b="$BUNDLE_GB" -v u="$USED_GB" 'BEGIN { printf "%.0f", b - u }') GB reclaimable with hdiutil compact (see docs/README.md, Time Machine section)"
+            fi
+        else
+            print_kv "$bundle_name" "${BUNDLE_GB} GB on disk"
+        fi
+    done
+fi
+
+# ---------------------------------------------------------------------------
+echo ""
+if [ ${#WARNINGS[@]} -eq 0 ]; then
+    log_success "Time Machine looks healthy"
+    NEW_STATE="ok"
+else
+    log_error "${#WARNINGS[@]} issue(s) found"
+    NEW_STATE="warn"
+fi
+
+if [ "$NOTIFY" = "1" ]; then
+    OLD_STATE=$(cat "$STATE_FILE" 2>/dev/null || echo "ok")
+    if [ "$NEW_STATE" != "$OLD_STATE" ]; then
+        if [ "$NEW_STATE" = "warn" ]; then
+            MSG="${WARNINGS[1]//[\"\\]/}"
+            osascript -e "display notification \"${MSG}\" with title \"Time Machine health\" sound name \"Basso\"" 2>/dev/null
+        else
+            osascript -e 'display notification "Time Machine is healthy again" with title "Time Machine health"' 2>/dev/null
+        fi
+    fi
+    echo "$NEW_STATE" > "$STATE_FILE"
+fi
+
+[ "$NEW_STATE" = "ok" ]

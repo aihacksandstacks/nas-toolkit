@@ -15,22 +15,29 @@ Scripts live in this skill's `scripts/` folder and run from the Mac over `ssh na
 |---|---|---|
 | `preflight.sh` | No | You |
 | `snapshot-config.sh` | Writes one root-only tarball, stops nothing | You |
+| `fetch-firmware.sh <id> <md5>` | Downloads one official image to `/volume1/backups/firmware` and checks its MD5 | You |
 | `stop-containers.sh` | Yes, stops every container | Andy |
+| `install-firmware.sh <image>` | Yes, writes the inactive boot partition (no reboot) | Andy |
 | `postflight.sh` | No | You |
 | `postflight.sh --start` | Yes, starts saved containers | Andy |
+| `../host/install-swappiness.sh` | One-time: installs the timer that holds `vm.swappiness` at 10 | You or Andy |
 
 ## Who does what
 
-You run the read-only checks, read the results, and tell Andy exactly what to run next. Andy runs everything that stops, reboots, or starts things: `stop-containers.sh`, the firmware install or `sudo systemctl reboot`, and `postflight.sh --start`. The cabana repos' hooks block agents from stopping or restarting cabana services over ssh, and a reboot is the biggest version of that. Hand Andy the command in a `bash` block instead of running it.
+You run the read-only checks, read the results, and tell Andy exactly what to run next. Andy runs everything that stops, installs, reboots, or starts things: `stop-containers.sh`, `install-firmware.sh`, `sudo systemctl reboot`, and `postflight.sh --start`. Auto mode and the cabana repos' hooks block agents from these, so hand Andy each command in a `bash` block instead of running it.
+
+**Tell Andy this at the start, before he plans around the job.** This is not an unattended job: he has to be at a keyboard for the whole outage, about 20 minutes for three firmware hops. On 2026-11-18 he found that out at 1 AM, ready for bed.
 
 ## Steps
 
 1. **Ask what and when.** Firmware update, reboot only, or hardware work. For firmware, work out the path before anything else:
    - The current version is on preflight's `Versions` line (`OS_VERSION` in `/etc/os-release`). Don't trust the version the user names. The box may be older than they think, and the cached image in `/tmp/.cache/ugreen` may be months stale.
-   - Find the latest UGOS Pro build and its minimum-version requirement. Some builds need an intermediate hop, which means more than one reboot.
-   - Read the release notes for each hop and flag Docker Engine major-version jumps, network or firewall changes, and storage changes. A Docker major jump can break `daemon.json` options, the DOCKER-USER rules, or the compose stacks.
-   - Say where each fact came from. Third-party write-ups are not UGREEN's changelog. Don't assume a rollback exists.
+   - Get the build list from UGREEN's Download Center, not from blogs: `ai.ugreen.com/pages/downloads`, NAS, DXP4800 Plus, System Firmware. It renders in a browser only. Each row shows the minimum version it needs, and that decides the hops. Third-party posts got this wrong in November 2026: they said two hops and Docker 29 in 1.17, but it took three hops and Docker 29 arrived with 1.21.
+   - From each row you need, record the download id (the `id=` in the Download button's `data-cont` link) and the MD5 (the MD5 button's `data-cont`).
+   - Read the release notes for each hop and flag Docker Engine major-version jumps, kernel jumps, network or firewall changes, and storage changes.
+   - Say where each fact came from. UGOS keeps the previous system on the other boot partition (`grub.cfg.bak`), but treat rollback as untested.
    - Let Andy pick the target before you go on.
+   - Run `fetch-firmware.sh <id> <md5>` for each hop now, well before the window. It refuses a file whose MD5 doesn't match.
 
 2. **Run `preflight.sh`** and report its result line plus the reasons.
    - `GO` (exit 0): continue.
@@ -53,17 +60,26 @@ You run the read-only checks, read the results, and tell Andy exactly what to ru
 
 6. **Andy stops the containers.** `stop-containers.sh` saves the running list to `/volume1/docker/.pre-reboot-running.txt` and stops everything with a 60-second grace period so Postgres shuts down cleanly. It has to save the list first: a container stopped by hand stays stopped after the reboot, even with `unless-stopped`.
 
-7. **Andy updates or reboots.** Firmware goes through the UGOS Control Panel update page, which reboots on its own. A plain reboot is `ssh nas sudo systemctl reboot`. He should be on the home LAN for firmware. If `tailscaled` doesn't come back, the LAN IP 192.168.1.113 is the only way in.
+7. **Andy updates or reboots.**
+   - Firmware: `install-firmware.sh <image filename>`. It refuses to run while containers are up, runs the package's own `ugpt` installer, and prints `INSTALLED` when the log says `Successful`. It does not reboot. Don't use `/usr/sbin/ugospro-upgrade` directly: on 1.13 it deletes the image and then fails. The Control Panel update page also works, but only offers what UGOS chooses, and it reboots on its own.
+   - Reboot: `ssh nas sudo systemctl reboot`. Only after `INSTALLED`, never after a failed install.
+   - The installer sets root's password to `*` (locked). That's harmless, since everything goes through sudo.
+   - If `tailscaled` doesn't come back, the LAN IP 192.168.1.113 is the only way in.
 
 8. **Wait for SSH.** Poll `ssh -o ConnectTimeout=5 nas uptime` about every 30 seconds for up to 10 minutes. Don't spin on it faster than that.
 
-9. **Run `postflight.sh`.** If the only failure is "saved containers not running", ask Andy to run `postflight.sh --start`, then run `postflight.sh` again. Anything else is a real problem: swappiness reset, drop-in gone, Docker root moved, cron job lost, DOCKER-USER rules missing, cabana healthcheck failing. Report it with the exact output line and don't call it done.
+9. **Run `postflight.sh`.** It waits up to 3 minutes for Docker first. On 1.21 the app manager (`app_serv`) put `docker_serv.service` back about a minute after boot, so don't panic at `docker_serv inactive` in the first minute; read `journalctl -b -u app_serv` if it stays down. If the only failure is "saved containers not running", ask Andy to run `postflight.sh --start`, then run `postflight.sh` again. These failures need handling first:
+   - "`X` was replaced by running `Y`": a firmware update recreated a UGOS App Center app under a new name. 1.17 turned `jellyfin-app-1` into `comugreendockerjellyfin-app-1`. Remove `X` from the saved list (`sudo sed -i '/^X$/d' /volume1/docker/.pre-reboot-running.txt`) and don't start it, because it would collide on the same port and config.
+   - "restart loop": read `docker logs`. On 2026-11-18, `paperless-retention-1` (runs as `nobody`) lost read on its bind-mounted `rules.yaml` after the update. `chmod o+r` fixed it, but check the file holds no secrets before you open it up.
+   - "`cabana-swappiness.timer` not enabled": run `../host/install-swappiness.sh`. UGOS's `ugzram.sh` resets swappiness to 60 about 30 s after every boot, and the timer sets it back.
+
+   Anything else is a real problem: drop-in gone, Docker root moved, cron job lost, DOCKER-USER rules missing, cabana healthcheck failing. Report it with the exact output line and don't call it done.
 
    **Multi-hop firmware:** after each intermediate reboot, run `postflight.sh` without `--start` and check that the `Versions` line moved to the expected build. Leave containers stopped between hops so prod comes back once, on the final firmware. Fix any host FAIL before Andy installs the next hop. Run `--start` only after the last one.
 
 10. **Close out.** When `postflight.sh` prints `ALL GOOD`:
    - Andy removes the saved list: `ssh nas sudo rm /volume1/docker/.pre-reboot-running.txt`
-   - After a firmware update, delete any older images in `/tmp/.cache/ugreen`. UGOS downloads updates into RAM-backed `/tmp`.
+   - After a firmware update, delete any older images in `/tmp/.cache/ugreen` (UGOS downloads updates into RAM-backed `/tmp`) and the installed hops in `/volume1/backups/firmware`, keeping the newest.
    - Add a row to the SOP's History table: date, change, old and new firmware, the activity check result or override record, and anything that broke.
 
 ## Override (emergency only)

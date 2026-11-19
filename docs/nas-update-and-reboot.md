@@ -8,10 +8,13 @@ Agents follow the same procedure through the `nas-reboot` skill (`skills/nas-reb
 |---|---|---|
 | `skills/nas-reboot/scripts/preflight.sh` | Activity gate, window, RAID, UPS, backups, GODEBUG drop-ins | No |
 | `skills/nas-reboot/scripts/snapshot-config.sh` | Tars the hand-built host config (units, drop-ins, cron, sysctl, daemon.json, tunnel creds, `/opt` stacks and `.env`) to `/volume1/backups/pre-reboot/` | Writes a backup only |
+| `skills/nas-reboot/scripts/fetch-firmware.sh` | Downloads an official firmware image to `/volume1/backups/firmware` and checks its MD5 | Writes the image only |
 | `skills/nas-reboot/scripts/stop-containers.sh` | Saves the running list, stops every container | Yes |
+| `skills/nas-reboot/scripts/install-firmware.sh` | Installs one image to the inactive boot partition. Doesn't reboot | Yes |
 | `skills/nas-reboot/scripts/postflight.sh` | Post-boot checks. `--start` starts saved containers that didn't come back | Only with `--start` |
+| `skills/nas-reboot/host/install-swappiness.sh` | One-time install of the timer that holds `vm.swappiness` at 10 | Yes, once |
 
-Agents run the read-only scripts. Andy runs anything that stops, reboots, or starts things.
+Agents run the read-only scripts. Andy runs anything that stops, installs, reboots, or starts things, so he has to be at a keyboard for the whole outage. This is not an unattended job.
 
 ## 1. Pick a window
 
@@ -19,8 +22,10 @@ Agents run the read-only scripts. Andy runs anything that stops, reboots, or sta
 - Not 02:00 to 05:00. Root cron runs the paperless export (Sun 02:00), Docker prune (Sun 03:00), mesh hub backup (03:15), sandbox menu mirror (03:45), Supabase backup (04:30), and Retell backup (04:45).
 - Tell the household that SMB, Jellyfin, Time Machine, and Paperless will be down.
 - For a firmware update:
-  - Check the real current version on preflight's `Versions` line. Find the latest build and its minimum-version requirement, since some targets need an intermediate hop and another reboot.
-  - Read the release notes for every hop. Watch for a Docker Engine major jump, network, or storage changes.
+  - Check the real current version on preflight's `Versions` line.
+  - Get the builds from UGREEN's Download Center (`ai.ugreen.com/pages/downloads`, NAS, DXP4800 Plus, System Firmware). Each row shows the minimum version it needs, and that sets the hops. Blogs got this wrong in November 2026.
+  - Record each hop's download id and MD5 from the page, then run `fetch-firmware.sh <id> <md5>` per hop ahead of the window.
+  - Read the release notes for every hop. Watch for a Docker Engine major jump, a kernel jump, network, or storage changes.
   - Be on the home LAN.
   - Don't assume you can roll back.
 
@@ -87,8 +92,10 @@ On healthchecks.io, pause PROD_HEALTH, PROD_CANARY, CARD_PAGE, MARKETING, STAFF_
 
 ## 6. Update or reboot
 
-- Firmware: install it from the update page in the UGOS Control Panel. The NAS reboots on its own.
+- Firmware: `install-firmware.sh <image filename>`, then `ssh nas sudo systemctl reboot` once it prints `INSTALLED`. It runs the package's own `ugpt` installer on a copy of the image. `/usr/sbin/ugospro-upgrade` on 1.13 deletes the image and then fails. The Control Panel update page works too, but it picks the version and reboots on its own.
 - Reboot only: `ssh nas sudo systemctl reboot`.
+
+The installer writes the inactive boot partition and keeps the previous system's grub entry in `/boot/EFI/debian/grub.cfg.bak`. It also locks root's password, which is harmless since we use sudo.
 
 Wait for `ssh nas uptime` to answer. Try Tailscale first. If it hasn't come back after 10 minutes, try the LAN IP 192.168.1.113.
 
@@ -110,7 +117,10 @@ The first run starts anything from the saved list that didn't come back. The sec
 - every saved container is running and none is unhealthy
 - the cabana healthcheck passes
 
-A firmware overlay can reset any of these. Fix each FAIL before calling the change done.
+A firmware overlay can reset any of these. Fix each FAIL before calling the change done. Postflight waits up to 3 minutes for Docker, because on 1.21 `app_serv` restored `docker_serv.service` about a minute after boot. It also fails on:
+- a saved container that a UGOS App Center app replaced under a new name (remove it from the list, don't start it)
+- a container stuck in a restart loop
+- a missing `cabana-swappiness.timer`
 
 For a multi-hop update, run `postflight.sh` without `--start` after each intermediate reboot. Confirm the version moved, fix any host FAIL, and leave containers stopped until the final hop.
 
@@ -129,6 +139,8 @@ Add a History row: date, change, old and new firmware, the preflight result or o
 ## Known risks
 
 - `cloudflared-update.timer` runs `cloudflared update` every night and restarts `cloudflared` when an update lands. That bypasses the "human runs the restart" rule in the Cloudflare runbook. It doesn't touch `cloudflared-agent-mesh`.
+- UGOS's `/usr/sbin/ugzram.sh` (run by `ctl_serv` about 30 s after boot) sets `vm.swappiness=60`, overriding `/etc/sysctl.d/99-zz-cabana-swappiness.conf`. `cabana-swappiness.timer` puts it back 90 s after boot and every 10 minutes.
+- A firmware update can tighten file permissions under `/volume1/docker`. On 2026-11-18, a container running as `nobody` lost read on its bind-mounted config.
 - `/volume2` is a single NVMe drive with no redundancy. It holds the Docker data root, Jellyfin, and every container volume. If it fails to mount, no container starts.
 
 ## History
@@ -137,3 +149,4 @@ Add a History row: date, change, old and new firmware, the preflight result or o
 |---|---|---|---|---|
 | 2026-02-18 | RAM upgrade, Docker root move | | | See `cabana-staff-platform/docs/runbook-2026-02-18-maintenance.md` |
 | 2026-10-27 | cloudflared upgrade | 1.13.1.0105 | | 75 s outage, GODEBUG drop-ins added |
+| 2026-11-18 | Firmware, 3 hops (1.17.0.0095, 1.19.1.0126, 1.21.1.0016) | 1.13.1.0105 to 1.21.1.0016 | GO 20:52, no client traffic since 20:31 | ~20 min prod outage (20:53 to 21:13). Installed from official images with the package's own `ugpt upgrade -i <img> -a amd64`; the system `ugospro-upgrade` deletes the image and then fails. Kernel 6.12 to 6.18, Docker 26.1 to 29.6. After the 1.21 boot Docker took ~1 min until app_serv restored `docker_serv.service`. UGOS recreated Jellyfin as `comugreendockerjellyfin-app-1`; the old `jellyfin-app-1` was dropped from the start list. Paperless retention lost read on `rules.yaml` (fixed with `chmod o+r`). `vm.swappiness` reset to 60 (UGOS `ugzram.sh`); fixed with `cabana-swappiness.timer`. |

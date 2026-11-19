@@ -1,0 +1,13 @@
+# Hold vm.swappiness at 10 on Black-Betty.
+# UGOS ctl_serv runs /usr/sbin/ugzram.sh about 30 s after boot, and that
+# script runs `sysctl -w vm.swappiness=60`. That is after systemd-sysctl
+# applies /etc/sysctl.d/99-zz-cabana-swappiness.conf, so the file alone
+# loses. cabana-swappiness.timer runs this after boot and every 10 minutes.
+# Install: skills/nas-reboot/host/install-swappiness.sh
+[Unit]
+Description=Hold vm.swappiness at 10 (UGOS ugzram.sh resets it to 60)
+After=ctl_serv.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c '[ "$(sysctl -n vm.swappiness)" = 10 ] || sysctl -w vm.swappiness=10'

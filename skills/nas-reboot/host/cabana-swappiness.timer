@@ -1,0 +1,9 @@
+[Unit]
+Description=Hold vm.swappiness at 10 after UGOS zram setup and later resets
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target

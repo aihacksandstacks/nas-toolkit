@@ -199,7 +199,10 @@ NAS_USER="root"
 NAS_SSH_HOST="nas"
 
 # NAS Paths
-NAS_STORAGE_BASE="/volume1/mac-offload"
+NAS_SMB_SHARE="personal_folder"            # your home share: only you can read it
+NAS_MOUNT_POINT="/Volumes/personal_folder"
+NAS_SHARE_ROOT="/home/your-username"       # what the share exposes
+NAS_STORAGE_BASE="${NAS_SHARE_ROOT}/mac-offload"
 NAS_CACHE_DIR="${NAS_STORAGE_BASE}/caches"
 NAS_ARCHIVE_DIR="${NAS_STORAGE_BASE}/archives"
 ```
@@ -225,7 +228,7 @@ NAS_ARCHIVE_DIR="${NAS_STORAGE_BASE}/archives"
 
 ## NAS Directory Structure
 
-Created on your NAS at `/volume1/mac-offload/`:
+Created on your NAS inside your home share, at `/home/<user>/mac-offload/`. Using the home share instead of a shared folder keeps the data readable by your account only.
 
 ```
 mac-offload/
@@ -249,7 +252,7 @@ When you run `nas-cache move npm`, the toolkit:
 
 1. **Syncs** `~/.npm` to NAS via rsync
 2. **Removes** local `~/.npm` directory
-3. **Creates symlink** `~/.npm` → `/volume1/mac-offload/caches/npm`
+3. **Creates symlink** `~/.npm` → `/Volumes/personal_folder/mac-offload/caches/npm`
 
 npm continues to work exactly the same - it just reads/writes over the network.
 

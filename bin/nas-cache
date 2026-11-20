@@ -119,7 +119,7 @@ show_status() {
         local local_path=$(get_local_path "$cache")
         local nas_subdir=$(get_nas_subdir "$cache")
         local nas_path="$NAS_CACHE_DIR/$nas_subdir"
-        local mount_path="${nas_path/#$NAS_STORAGE_BASE/$NAS_MOUNT_POINT}"
+        local mount_path=$(nas_to_mount_path "$nas_path")
 
         local size="0"
         local location="-"
@@ -176,7 +176,7 @@ move_cache() {
     local local_path=$(get_local_path "$cache")
     local nas_subdir=$(get_nas_subdir "$cache")
     local nas_path="$NAS_CACHE_DIR/$nas_subdir"
-    local mount_path="${nas_path/#$NAS_STORAGE_BASE/$NAS_MOUNT_POINT}"
+    local mount_path=$(nas_to_mount_path "$nas_path")
     local desc=$(get_description "$cache")
 
     log_step "Moving $cache cache to NAS"
@@ -265,7 +265,7 @@ restore_cache() {
     local local_path=$(get_local_path "$cache")
     local nas_subdir=$(get_nas_subdir "$cache")
     local nas_path="$NAS_CACHE_DIR/$nas_subdir"
-    local mount_path="${nas_path/#$NAS_STORAGE_BASE/$NAS_MOUNT_POINT}"
+    local mount_path=$(nas_to_mount_path "$nas_path")
 
     log_step "Restoring $cache cache to local"
 

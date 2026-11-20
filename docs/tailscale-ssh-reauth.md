@@ -1,5 +1,7 @@
 # Tailscale SSH re-auth loop (deploys break ~once a day)
 
+> **Status: fixed 2026-10-11.** See [Fix](#fix-applied-2026-10-11-in-the-tailscale-admin-console).
+
 Diagnosed 2026-07-29. Tailnet `h2ds.ai`. Affects anything reaching `black-betty` over
 `ssh://nas` (host `nas` → `black-betty`, user `root`) — cron, agent sessions, and
 cabana-web's `deploy-prod.sh` / `deploy-sandbox.sh`.
@@ -88,71 +90,80 @@ Tailscale ships in new tailnets:
 }
 ```
 
-## Fix (requires the Tailscale admin console — Andy's clicks)
+## Fix (applied 2026-10-11 in the Tailscale admin console)
 
-`checkPeriod` maxes out at 168h (one week) and has no "never" value, so raising it
-only converts a daily interruption into a weekly one. To remove the recurring browser
-prompt, the rule covering Andy's own devices must be `accept`, not `check`.
+**Rule order does not matter.** Tailscale evaluates SSH rules "using the most
+restrictive policies first": when a connection matches both an `accept` and a `check`
+rule, `check` wins regardless of where each sits in the policy file
+([ACL syntax docs](https://tailscale.com/kb/1337/acl-syntax)). An earlier version of
+this doc said to add an `accept` rule *above* the `check` rule. That was tried on
+2026-10-10 and changed nothing: the node still compiled `check` first and the prompt
+returned 12h later.
 
-Admin console → **Access Controls** → edit the policy file. Add an `accept` rule
-scoped to Andy specifically, *above* the existing `check` rule (first match wins), and
-leave the `check` rule in place for everyone else:
+`checkPeriod` maxes out at 168h with no "never" value, so it cannot remove the prompt
+either. The only fix is for **no `check` rule to match Andy's devices**. The `ssh`
+section now reads:
 
-```diff
-   "ssh": [
-+    // Andy's own devices, non-interactively. `check` here forced a browser
-+    // re-auth every 12h, which broke docker-over-SSH deploys and cron.
-+    {
-+      "action": "accept",
-+      "src":    ["andy@h2ds.ai"],
-+      "dst":    ["autogroup:self"],
-+      "users":  ["autogroup:nonroot", "root"]
-+    },
-     {
-       "action": "check",
-       "src":    ["autogroup:member"],
-       "dst":    ["autogroup:self"],
-       "users":  ["autogroup:nonroot", "root"]
-     }
-   ]
+```json
+"ssh": [
+  {
+    "action": "accept",
+    "src":    ["andy@h2ds.ai"],
+    "dst":    ["autogroup:self"],
+    "users":  ["autogroup:nonroot", "root"]
+  },
+  {
+    "action": "check",
+    "src":    ["hannahhepler@gmail.com"],
+    "dst":    ["autogroup:self"],
+    "users":  ["autogroup:nonroot", "root"]
+  }
+],
 ```
 
-Why this is the narrow version:
-
-- `dst: autogroup:self` already means "the source user's own untagged devices", so
-  this grants Andy access to Andy's machines and nothing else. `black-betty` is
-  untagged and owned by `andy@h2ds.ai`, so it is covered.
-- Other tailnet members (Hannah) keep `check`, and even under `accept` they would
-  only ever reach *their own* devices — never the NAS.
-- Nothing is opened to `autogroup:shared`, tagged infrastructure, or the internet.
-
-Do not simply flip the existing rule's `check` to `accept` unless you intend that for
-every member. The extra rule is one more line and strictly narrower.
+- The stock rule's `src: ["autogroup:member"]` included Andy, which is what kept the
+  `check` matching. It is narrowed to Hannah's login, so Andy matches only `accept`.
+- `dst: autogroup:self` means "the source user's own untagged devices". Andy reaches
+  Andy's machines (including `black-betty`, untagged and owned by `andy@h2ds.ai`);
+  Hannah reaches only hers, with the periodic check.
+- A member added later gets no Tailscale SSH until a rule names them.
+- Hannah's rule does **not** let anyone SSH from her Mac into Andy's devices. To work
+  on the NAS from her machine, switch that Mac's Tailscale to Andy's account
+  temporarily (menu bar, account switcher), or SSH from one of Andy's own devices.
 
 Optional posture improvement, separate change: `~/.ssh/config` uses `User root` for
 host `nas` because the docker socket needs it. Dropping `root` from the `users` list
 and switching to a non-root user in a `docker` group would let the rule be
-`["autogroup:nonroot"]` only. Out of scope here.
+`["autogroup:nonroot"]` only.
 
-### Verify after the console change
+### Verify after a policy change
+
+Read the compiled rules from the server node. After the fix, `black-betty` holds a
+single standing `accept` rule covering Andy's node IPs, with no `check`
+(`holdAndDelegate`) rule and no expiring grant:
 
 ```bash
+ssh -o ControlPath=none nas 'tailscale debug netmap' | python3 -c '
+import json,sys
+for r in json.load(sys.stdin)["SSHPolicy"]["rules"]:
+    a=r["action"]; print("accept" if a.get("accept") else "check" if a.get("holdAndDelegate") else a,
+                         len(r.get("principals",[])), r.get("ruleExpires","(standing)"))'
 ssh -o BatchMode=yes -o ControlPath=none -o ConnectTimeout=15 nas true && echo OK
 docker --context nas ps
-ssh nas 'tailscale debug netmap' | grep -c holdAndDelegate   # expect the rule gone for this node
 ```
 
+Verified 2026-10-11: one rule, `accept`, 12 principals, standing; fresh handshake OK.
+
 `ControlPath=none` matters: `~/.ssh/config` sets `ControlPersist 600` for `nas`, so a
-warm multiplexed connection keeps working after the grant lapses and will mask the
+warm multiplexed connection keeps working after a grant lapses and will mask the
 problem. Always test a fresh handshake.
 
 ## Unrelated hygiene found while diagnosing
 
-The MacBook has a Homebrew `tailscale` CLI at 1.92.5 while the running daemon is
-1.98.9, so every CLI call prints a version-mismatch warning. Either
-`brew uninstall tailscale` and use the app's binary
-(`/Applications/Tailscale.app/Contents/MacOS/Tailscale`), or `brew upgrade tailscale`.
-Not a cause of the re-auth loop.
+The MacBook had a Homebrew `tailscale` CLI at 1.92.5 while the running daemon was
+1.98.9, so every CLI call printed a version-mismatch warning. Not a cause of the
+re-auth loop. Resolved 2026-10-10: the Homebrew CLI is gone and the MacBook runs the
+Standalone Tailscale app, whose installer provides `/usr/local/bin/tailscale`.
 
 ## Deploy-script hardening (already landed, independent of the console fix)
 

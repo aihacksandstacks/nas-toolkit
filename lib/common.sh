@@ -160,3 +160,11 @@ print_kv() {
     local color=${3:-$NC}
     printf "  %-25s ${color}%s${NC}\n" "$key:" "$value"
 }
+
+# Translate a NAS-side path into its path on the local SMB mount.
+# The share exposes NAS_SHARE_ROOT at NAS_MOUNT_POINT; older configs mounted
+# the offload folder itself, so fall back to NAS_STORAGE_BASE.
+nas_to_mount_path() {
+    local root="${NAS_SHARE_ROOT:-$NAS_STORAGE_BASE}"
+    echo "${1/#$root/$NAS_MOUNT_POINT}"
+}

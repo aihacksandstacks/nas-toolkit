@@ -10,6 +10,9 @@
 # Notifications are rate-limited: it only alerts on a state CHANGE (ok->alert),
 # so you don't get pinged every run.
 #
+# When free space is low, it runs cache-prune once on entering the alert state
+# (package caches are always safe to drop) and reports what that freed.
+#
 # Usage:
 #   space-guard          # Run a check (launchd calls this)
 #   space-guard status   # Show current readings and state
@@ -43,7 +46,7 @@ free_gb() {
 # Count of TM local snapshots.
 snap_count() {
     diskutil apfs listSnapshots "$DATA_VOLUME" 2>/dev/null \
-        | grep -c "com.apple.TimeMachine" || echo 0
+        | grep -c "com.apple.TimeMachine" || true   # grep -c already prints 0
 }
 
 # Age (days) of the oldest TM local snapshot, or 0 if none/unparseable.
@@ -95,7 +98,14 @@ LAST=$(get_state)
 if [ ${#reasons[@]} -gt 0 ]; then
     # Only notify on transition into alert, to avoid repeat pings.
     if [ "$LAST" != "alert" ]; then
-        notify "$(echo "${(j:, :)reasons}"). Run snapshot-reap / dev-clean."
+        # Caches are always safe to drop, so prune them before asking for help.
+        prune_note=""
+        if [ "$FREE" -lt "$MIN_FREE_GB" ]; then
+            prune_note=$("$SCRIPT_DIR/cache-prune" --quiet 2>&1 | tail -1) || true
+            echo "[space-guard] $prune_note"
+            FREE=$(free_gb)
+        fi
+        notify "$(echo "${(j:, :)reasons}"). ${prune_note:+$prune_note, now ${FREE}GB free. }Run snapshot-reap / dev-clean / dev-archive --suggest."
     fi
     set_state "alert"
     echo "[space-guard] ALERT: ${(j:, :)reasons}"

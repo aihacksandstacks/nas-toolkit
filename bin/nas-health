@@ -1,140 +1,144 @@
 #!/bin/zsh
 #
-# nas-health - Check and restore NAS mount if dropped
+# nas-health - Keep the NAS share mounted over the best available path.
 #
-# Run periodically via launchd to ensure NAS stays mounted.
-# Features:
-#   - Failure tracking with automatic pause after 3 failures
-#   - Rate-limited notifications (only on state changes)
-#   - Subcommands: status, resume
+# Run by launchd every 5 minutes AND whenever the network changes (Wi-Fi
+# join/leave, Tailscale up/down, wake from sleep). Each run:
+#   - remounts if the share dropped, preferring LAN over Tailscale
+#   - force-unmounts a dead mount (server gone) instead of letting it hang
+#   - moves an idle Tailscale mount onto the LAN once you are home
+#   - backs off after 3 failed mounts, and auto-resumes on the next network
+#     change or after 30 minutes
 #
 # Usage:
-#   nas-health          # Normal health check (run by launchd)
-#   nas-health status   # Show current health status
-#   nas-health resume   # Resume monitoring after pause
+#   nas-health          # Normal check (run by launchd)
+#   nas-health status   # Show state, mount and endpoint reachability
+#   nas-health resume   # Clear back-off and check immediately
 #
 
 SCRIPT_DIR="${0:A:h}"
-source "$SCRIPT_DIR/../config.sh"
+TOOLKIT_ROOT="${SCRIPT_DIR:h}"
+source "$TOOLKIT_ROOT/config.sh"
+source "$TOOLKIT_ROOT/lib/nas-endpoint.sh"
 
 STATE_DIR="$HOME/.nas-toolkit"
-STATE_FILE="$STATE_DIR/health-state"
+STATE_FILE="$STATE_DIR/health-state"      # failures:status:last_state
+NETSIG_FILE="$STATE_DIR/network-signature"
+PAUSED_AT_FILE="$STATE_DIR/paused-at"
 MAX_FAILURES=3
-
-# Initialize state directory
+RESUME_AFTER_SECONDS=1800
 mkdir -p "$STATE_DIR"
 
-# State functions
-# State format: failures:status:last_state
-# - failures: number of consecutive mount failures
-# - status: running|paused
-# - last_state: ok|failed (for notification rate-limiting)
-get_state() {
-    if [ -f "$STATE_FILE" ]; then
-        cat "$STATE_FILE"
-    else
-        echo "0:running:ok"
-    fi
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [nas-health] $*"; }
+notify() { osascript -e "display notification \"$1\" with title \"NAS Toolkit\"" 2>/dev/null; }
+
+get_state() { [ -f "$STATE_FILE" ] && cat "$STATE_FILE" || echo "0:running:ok"; }
+set_state() { echo "$1:$2:$3" > "$STATE_FILE"; }
+
+# Changes whenever the Mac's route to the world changes (new Wi-Fi, VPN up/down).
+network_signature() {
+    { route -n get default 2>/dev/null | awk '/gateway|interface/ {print $2}'
+      ifconfig 2>/dev/null | awk '/^utun|^en/ {i=$1} /inet 100\./ {print i}'
+    } | tr '\n' ' '
 }
 
-set_state() {
-    echo "$1:$2:$3" > "$STATE_FILE"
-}
-
-# Parse current state
 IFS=':' read -r FAILURES STATUS LAST_STATE <<< "$(get_state)"
 
-# Handle subcommands
 case "$1" in
     resume)
         set_state 0 "running" "$LAST_STATE"
-        echo "[nas-health] Resumed monitoring"
-        # Try an immediate mount
-        if ! mount | grep -q "$NAS_MOUNT_POINT"; then
-            "$SCRIPT_DIR/nas-mount" 2>/dev/null
-        fi
-        exit 0
+        rm -f "$PAUSED_AT_FILE"
+        log "Resumed monitoring"
+        exec "$0"
         ;;
     status)
         echo "NAS Health Status:"
         echo "  Consecutive failures: $FAILURES"
         echo "  Status: $STATUS"
         echo "  Last check: $LAST_STATE"
-        if mount | grep -q "$NAS_MOUNT_POINT"; then
-            echo "  Mount: connected at $NAS_MOUNT_POINT"
+        if is_mounted; then
+            alive=$(mount_alive && echo "responsive" || echo "UNRESPONSIVE")
+            echo "  Mount: $NAS_MOUNT_POINT via $(endpoint_label "$(mounted_host)") ($(mounted_host)), $alive"
         else
             echo "  Mount: not connected"
         fi
+        lan="unreachable"; smb_port_open "$NAS_LAN_IP" && lan="SMB open"
+        [ "$lan" = "SMB open" ] && ! has_keychain_creds "$NAS_LAN_IP" && lan="SMB open, no Keychain password"
+        echo "  LAN ${NAS_LAN_IP:-unset}: $lan"
+        ts="unreachable"; smb_port_open "$NAS_TS_IP" && ts="SMB open"
+        echo "  Tailscale $NAS_TS_IP: $ts"
         exit 0
         ;;
     help|--help|-h)
-        echo "nas-health - NAS connection health monitor"
-        echo ""
-        echo "Usage:"
-        echo "  nas-health          Normal health check (run by launchd)"
-        echo "  nas-health status   Show current health status"
-        echo "  nas-health resume   Resume monitoring after pause"
+        sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
         exit 0
         ;;
 esac
 
-# Check if paused
+# Let a network change settle (DHCP, Tailscale reconnect) before probing.
+sleep "${NAS_SETTLE_SECONDS:-3}"
+
+# Back-off: resume automatically when the network changes or time has passed.
+sig=$(network_signature)
+old_sig=$(cat "$NETSIG_FILE" 2>/dev/null)
+echo "$sig" > "$NETSIG_FILE"
 if [ "$STATUS" = "paused" ]; then
-    echo "[nas-health] Paused after $MAX_FAILURES failures. Run 'nas-health resume' to restart."
-    exit 0
-fi
-
-# Check if mount point exists
-if [ ! -d "$NAS_MOUNT_POINT" ]; then
-    echo "[nas-health] Mount point missing, creating..."
-    sudo mkdir -p "$NAS_MOUNT_POINT" 2>/dev/null
-fi
-
-# Check if already mounted and accessible
-if mount | grep -q "$NAS_MOUNT_POINT"; then
-    if [ -d "$NAS_MOUNT_POINT/caches" ]; then
-        # Successfully mounted - notify only if recovering from failure
-        if [ "$LAST_STATE" = "failed" ]; then
-            osascript -e 'display notification "NAS reconnected" with title "NAS Toolkit"' 2>/dev/null
-        fi
-        set_state 0 "running" "ok"
-        echo "[nas-health] NAS mounted and accessible"
+    paused_at=$(cat "$PAUSED_AT_FILE" 2>/dev/null || echo 0)
+    if [ "$sig" != "$old_sig" ] || [ $(( $(date +%s) - paused_at )) -ge $RESUME_AFTER_SECONDS ]; then
+        log "Auto-resuming after back-off (network changed or $((RESUME_AFTER_SECONDS / 60)) min elapsed)"
+        FAILURES=0; STATUS="running"
+        set_state 0 "running" "$LAST_STATE"
+        rm -f "$PAUSED_AT_FILE"
+    else
         exit 0
-    else
-        # Mount exists but not accessible, unmount and retry
-        echo "[nas-health] Mount exists but not accessible, remounting..."
-        umount "$NAS_MOUNT_POINT" 2>/dev/null
     fi
 fi
 
-# NAS not mounted - check if reachable
-if ! ping -c 1 -W 2 "$NAS_IP" &>/dev/null; then
-    echo "[nas-health] NAS not reachable at $NAS_IP, skipping mount attempt"
+# --- Already mounted: verify it is alive and on the best path ------------------
+if is_mounted; then
+    current=$(mounted_host)
+    if ! mount_alive; then
+        log "Mount via $(endpoint_label "$current") is unresponsive, force-unmounting"
+        unmount_share force
+    else
+        if [ "$current" != "$NAS_LAN_IP" ] && lan_ready; then
+            # Home again: move to the LAN, but only if nothing holds files open.
+            if unmount_share; then
+                log "LAN available, moving mount from $(endpoint_label "$current") to LAN"
+            else
+                log "LAN available but share is busy, staying on $(endpoint_label "$current")"
+            fi
+        fi
+        if is_mounted; then
+            [ "$LAST_STATE" = "failed" ] && notify "NAS reconnected"
+            set_state 0 "running" "ok"
+            log "OK, mounted via $(endpoint_label "$(mounted_host)")"
+            exit 0
+        fi
+    fi
+fi
+
+# --- Not mounted: mount from the best reachable endpoint ----------------------
+host=$(pick_endpoint)
+if [ -z "$host" ]; then
+    log "NAS unreachable on LAN and Tailscale, will retry on next network change"
     exit 0
 fi
 
-# Try to mount
-echo "[nas-health] Attempting to mount NAS..."
-"$SCRIPT_DIR/nas-mount" 2>/dev/null
-
-if mount | grep -q "$NAS_MOUNT_POINT"; then
-    # Success - reset failure count
+if out=$(mount_from "$host"); then
     set_state 0 "running" "ok"
-    echo "[nas-health] NAS remounted successfully"
-    osascript -e 'display notification "NAS cache remounted" with title "NAS Toolkit"' 2>/dev/null
-else
-    # Failed - increment failure count
-    FAILURES=$((FAILURES + 1))
+    log "Mounted via $(endpoint_label "$host") ($host)"
+    notify "NAS mounted via $(endpoint_label "$host")"
+    exit 0
+fi
 
-    if [ $FAILURES -ge $MAX_FAILURES ]; then
-        # Pause after too many failures
-        set_state $FAILURES "paused" "failed"
-        echo "[nas-health] Failed $FAILURES times, pausing monitoring."
-        echo "[nas-health] Run 'nas-health resume' to restart."
-        osascript -e 'display notification "NAS mount paused after failures. Run: nas-health resume" with title "NAS Toolkit" sound name "Basso"' 2>/dev/null
-    else
-        # Just track the failure
-        set_state $FAILURES "running" "failed"
-        echo "[nas-health] Mount failed ($FAILURES/$MAX_FAILURES before pause)"
-    fi
+FAILURES=$((FAILURES + 1))
+log "Mount via $(endpoint_label "$host") failed ($FAILURES/$MAX_FAILURES): $out"
+if [ $FAILURES -ge $MAX_FAILURES ]; then
+    set_state $FAILURES "paused" "failed"
+    date +%s > "$PAUSED_AT_FILE"
+    log "Backing off until the network changes or $((RESUME_AFTER_SECONDS / 60)) min pass"
+    notify "NAS mount failing, backing off. Run: nas-health status"
+else
+    set_state $FAILURES "running" "failed"
 fi

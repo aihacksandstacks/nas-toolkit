@@ -339,7 +339,7 @@ full_setup() {
     log_success "NAS toolkit is configured"
     echo ""
     log_info "Next steps:"
-    echo "  1. Run 'nas-cache setup' to move package caches to NAS"
+    echo "  1. Run 'cache-prune' to prune package caches"
     echo "  2. Run 'dev-clean' to clean up existing projects"
     echo "  3. Run 'space-audit' to see current disk usage"
     echo ""

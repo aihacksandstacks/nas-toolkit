@@ -6,7 +6,7 @@ A CLI toolkit for macOS developers to offload storage to a NAS, keeping your loc
 
 NAS Toolkit helps you:
 - **Run Docker on your NAS** instead of locally (saves 20-100GB+)
-- **Move package caches to NAS** via symlinks (npm, pip, homebrew, etc.)
+- **Prune package caches** in place (npm, uv, pnpm, pip, Homebrew, conda)
 - **Clean development artifacts** (node_modules, venvs, build outputs)
 - **Archive inactive projects** to NAS cold storage
 - **Audit disk usage** with actionable recommendations
@@ -36,8 +36,8 @@ space-audit
 # 2. Configure NAS connection
 nas-setup
 
-# 3. Move caches to NAS
-nas-cache setup
+# 3. Prune package caches
+cache-prune
 
 # 4. Clean development projects
 dev-clean
@@ -62,28 +62,16 @@ nas-setup --uninstall-docker-desktop  # Remove Docker Desktop
 3. Creates NAS directory structure
 4. Optionally removes Docker Desktop
 
-### `nas-cache`
+### `cache-prune`
 
-Manages package caches - moves them to NAS and symlinks back.
+Prunes package-manager caches in place: npm, npx installs not in use and idle 30+ days, uv, pnpm, pip, Homebrew, conda, and simulators with no runtime. Every one of these is a cache the tool downloads again on demand. space-guard runs it once when free space drops below its threshold.
 
 ```bash
-nas-cache status       # Show cache status and sizes
-nas-cache setup        # Interactive setup of all caches
-nas-cache move npm     # Move specific cache to NAS
-nas-cache restore pip  # Bring cache back to local
-nas-cache list         # List supported cache types
-nas-cache verify       # Verify symlinks are working
+cache-prune            # Prune everything, report MB freed per cache
+cache-prune --dry-run  # Show sizes and the commands it would run
 ```
 
-**Supported caches:**
-- npm, yarn, pnpm (Node.js)
-- pip, pypoetry, uv (Python)
-- cargo (Rust)
-- homebrew
-- go modules
-- gradle, maven (Java)
-- cocoapods (iOS)
-- playwright
+It replaces `nas-cache`, which symlinked caches onto the NAS share. Over SMB through Tailscale (about 20 MB/s) that made installs slow, and it broke the tools whenever the share was not mounted. cache-prune warns if a cache directory is still a symlink from those days.
 
 ### `dev-clean`
 
@@ -112,32 +100,31 @@ dev-clean /path/to/project  # Clean specific project
 
 ### `dev-archive`
 
-Archives inactive projects to NAS cold storage.
+Archives an inactive project to `mac-offload/archives/repos/` on the NAS share, reads the archive back to verify it, and only then deletes the local copy (with `--clean`).
 
 ```bash
-dev-archive /path/to/project    # Archive specific project
-dev-archive --list              # List archived projects
-dev-archive --suggest           # Get archival recommendations
-dev-archive --stale 90          # Find 90-day inactive projects
-dev-archive --stale 60 --all    # Archive all 60-day inactive projects
+dev-archive --suggest [DAYS]      # Projects idle DAYS+ days (default 90), with git state
+dev-archive ~/dev/old-project     # Archive and verify, keep local copy
+dev-archive ~/dev/old-project --clean   # ...then delete the local copy
+dev-archive --list                # Archives on the NAS
 ```
 
-**Archive process:**
-1. Project is cleaned (artifacts removed)
-2. Compressed with tar/gzip
-3. Transferred to NAS
-4. Metadata saved for restoration
-5. Optionally removes local copy
+- The archive keeps `.git` (stashes, unpushed branches), `.env` and other untracked files. It leaves out directories a package manager rebuilds: `node_modules`, `.venv`, `Pods`, `.next`, `DerivedData` and similar, plus `target` in Rust projects.
+- It writes through the SMB mount, so it needs no ssh or rsync on the NAS.
+- It refuses a linked worktree, and a repo that still has linked worktrees, since archiving would orphan them.
+- A `<name>.json` manifest records the remote, branch, HEAD, dirty, unpushed and stash counts, and the archive's sha256.
+- Re-archiving keeps the previous archive under a timestamped name.
 
 ### `dev-restore`
 
-Restores archived projects from NAS.
-
 ```bash
-dev-restore project-name        # Restore to ~/dev/
-dev-restore project --to /tmp   # Restore to specific location
-dev-restore --list              # List available archives
+dev-restore old-project               # Restore to ~/dev/old-project
+dev-restore old-project --to /tmp     # Restore to /tmp/old-project
+dev-restore old-project --delete-archive
+dev-restore --list
 ```
+
+It checks the sha256 against the manifest before extracting and never overwrites an existing directory. Reinstall dependencies afterwards; it prints the commands for the lockfiles it finds.
 
 ### `space-audit`
 
@@ -199,7 +186,10 @@ NAS_USER="root"
 NAS_SSH_HOST="nas"
 
 # NAS Paths
-NAS_STORAGE_BASE="/volume1/mac-offload"
+NAS_SMB_SHARE="personal_folder"            # your home share: only you can read it
+NAS_MOUNT_POINT="/Volumes/personal_folder"
+NAS_SHARE_ROOT="/home/your-username"       # what the share exposes
+NAS_STORAGE_BASE="${NAS_SHARE_ROOT}/mac-offload"
 NAS_CACHE_DIR="${NAS_STORAGE_BASE}/caches"
 NAS_ARCHIVE_DIR="${NAS_STORAGE_BASE}/archives"
 ```
@@ -210,7 +200,7 @@ NAS_ARCHIVE_DIR="${NAS_STORAGE_BASE}/archives"
 ~/dev/nas-toolkit/
 ├── bin/                # CLI commands
 │   ├── nas-setup       # NAS connection setup
-│   ├── nas-cache       # Cache management
+│   ├── cache-prune     # Package cache pruning
 │   ├── dev-clean       # Project cleanup
 │   ├── dev-archive     # Project archival
 │   ├── dev-restore     # Project restoration
@@ -225,33 +215,17 @@ NAS_ARCHIVE_DIR="${NAS_STORAGE_BASE}/archives"
 
 ## NAS Directory Structure
 
-Created on your NAS at `/volume1/mac-offload/`:
+Created on your NAS inside your home share, at `/home/<user>/mac-offload/`. Using the home share instead of a shared folder keeps the data readable by your account only.
 
 ```
 mac-offload/
-├── caches/
-│   ├── npm/
-│   ├── pip/
-│   ├── pypoetry/
-│   ├── homebrew/
-│   ├── cargo/
-│   └── ...
+├── models/             # AI model files (the Mac links here)
 └── archives/
     └── repos/
         ├── old-project.tar.gz
         ├── old-project.json
         └── ...
 ```
-
-## How Symlinks Work
-
-When you run `nas-cache move npm`, the toolkit:
-
-1. **Syncs** `~/.npm` to NAS via rsync
-2. **Removes** local `~/.npm` directory
-3. **Creates symlink** `~/.npm` → `/volume1/mac-offload/caches/npm`
-
-npm continues to work exactly the same - it just reads/writes over the network.
 
 ## Docker on NAS
 
@@ -354,24 +328,14 @@ docker context ls
 docker --context nas info
 ```
 
-### Symlink not working
-```bash
-# Verify symlink
-ls -la ~/.npm
-
-# Check if NAS is mounted/accessible
-nas-cache verify
-```
-
 ## Typical Space Savings
 
 | Item | Typical Size | Action |
 |------|--------------|--------|
 | Docker Desktop | 20-100 GB | `nas-setup --uninstall-docker-desktop` |
-| npm cache | 5-20 GB | `nas-cache move npm` |
-| pip cache | 2-10 GB | `nas-cache move pip` |
+| Package caches | 5-20 GB | `cache-prune` |
 | node_modules (all) | 5-30 GB | `dev-clean` |
-| Inactive projects | varies | `dev-archive` |
+| Inactive projects | varies | `dev-archive --suggest`, then `dev-archive <path> --clean` |
 
 ## Tips
 
@@ -379,7 +343,7 @@ nas-cache verify
 2. **Use `dev-clean --stale 30`** to auto-clean inactive projects
 3. **Archive projects** you're not actively working on
 4. **Keep Docker on NAS** - there's no good reason to run it locally
-5. **Symlink ALL package caches** - they're fully regenerable
+5. **Prune package caches, don't move them** - `cache-prune` is safe any time
 
 ## License
 

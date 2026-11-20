@@ -87,6 +87,14 @@ echo -e "${BLUE}[4/5]${NC} Setting up auto-mount service..."
 
 mkdir -p "$LAUNCHD_DIR"
 
+# Build the no-UI NetFS mount helper (needs Xcode command line tools)
+if command -v swiftc >/dev/null 2>&1; then
+    swiftc -O -o "$TOOLKIT_DIR/bin/nas-netfs-mount" "$TOOLKIT_DIR/lib/netfs-mount.swift" &&
+        echo -e "${GREEN}Built bin/nas-netfs-mount${NC}"
+else
+    echo -e "${YELLOW}Warning: swiftc not found; install Xcode command line tools, then rerun install.sh${NC}"
+fi
+
 # Generate plist from template with correct path
 if [ -f "$TOOLKIT_DIR/com.nas-toolkit.health.plist.template" ]; then
     sed "s|__TOOLKIT_DIR__|$TOOLKIT_DIR|g" \
@@ -97,7 +105,7 @@ if [ -f "$TOOLKIT_DIR/com.nas-toolkit.health.plist.template" ]; then
     launchctl unload "$LAUNCHD_DIR/$PLIST_NAME" 2>/dev/null || true
     launchctl load "$LAUNCHD_DIR/$PLIST_NAME"
 
-    echo -e "${GREEN}Auto-mount service installed (runs every 5 minutes)${NC}"
+    echo -e "${GREEN}Auto-mount service installed (runs on network changes and every 5 minutes)${NC}"
 else
     echo -e "${YELLOW}Warning: plist template not found, skipping auto-mount setup${NC}"
 fi
@@ -153,7 +161,7 @@ echo "  2. Run: source $SHELL_RC"
 echo ""
 echo -e "${BOLD}Available commands:${NC}"
 echo "  nas-setup      - Configure NAS connection and Docker"
-echo "  nas-cache      - Move package caches to NAS"
+echo "  cache-prune    - Prune package caches (npm, uv, pnpm, pip, brew, conda)"
 echo "  nas-mount      - Mount NAS share manually"
 echo "  dev-clean      - Clean project build artifacts"
 echo "  dev-archive    - Archive projects to NAS"

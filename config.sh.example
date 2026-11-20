@@ -8,19 +8,24 @@
 # NAS Connection
 export NAS_HOSTNAME="your-nas-hostname"      # Friendly name for your NAS
 export NAS_IP="100.x.x.x"                    # Tailscale IP or local IP
+
+# Connection paths (nas-mount / nas-health try LAN first, then Tailscale)
+export NAS_TS_IP="${NAS_IP}"            # Tailscale address
+export NAS_LAN_IP="192.168.1.x"         # LAN address (leave empty to use Tailscale only)
 export NAS_USER="your-username"              # SMB/SSH username for NAS
 # Password is handled by macOS Keychain - mount via Finder first to save credentials
 export NAS_SSH_HOST="nas"                    # SSH config alias (created by nas-setup)
 
 # SMB Mount Settings
-export NAS_SMB_SHARE="mac-offload"           # SMB share name on NAS
-export NAS_MOUNT_POINT="/Volumes/nas-cache"  # Local mount point
+export NAS_SMB_SHARE="personal_folder"           # SMB share name on NAS (your home share keeps data private)
+export NAS_MOUNT_POINT="/Volumes/personal_folder"  # Where macOS mounts it (NetFS uses /Volumes/<share>)
 
 # Docker
 export NAS_DOCKER_CONTEXT="nas"
 
-# NAS Mount Points (where data will be stored on NAS)
-export NAS_STORAGE_BASE="/volume1/mac-offload"  # Adjust to your NAS path
+# NAS paths (where data is stored on the NAS)
+export NAS_SHARE_ROOT="/home/your-username"      # NAS path the SMB share exposes; maps 1:1 to NAS_MOUNT_POINT
+export NAS_STORAGE_BASE="${NAS_SHARE_ROOT}/mac-offload"  # Offload root inside the share
 export NAS_CACHE_DIR="${NAS_STORAGE_BASE}/caches"
 export NAS_ARCHIVE_DIR="${NAS_STORAGE_BASE}/archives"
 export NAS_DOCKER_DIR="${NAS_STORAGE_BASE}/docker"

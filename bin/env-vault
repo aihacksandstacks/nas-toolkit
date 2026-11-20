@@ -1,0 +1,274 @@
+#!/bin/zsh
+#
+# env-vault - Encrypted backups of .env files, SSH keys and the Vaultwarden data
+#
+# Bundles every .env-style file under ~/dev (plus extra paths such as ~/.ssh and
+# the newest Vaultwarden backup from the NAS), encrypts the bundle with age, and
+# writes it to the NAS and to iCloud Drive. Plaintext never touches disk.
+#
+# Encrypting needs only the public key, so the nightly job runs unattended.
+# Decrypting needs identity.age AND its passphrase. Being logged in to the Mac
+# is not enough, and neither is a stolen NAS or iCloud account.
+#
+# Usage:
+#   env-vault init                  # Create the key; you choose the passphrase
+#   env-vault backup [--force]      # Encrypt and copy (launchd runs this nightly)
+#   env-vault status                # Key, destinations, last backup
+#   env-vault list                  # Archives on the NAS and in iCloud Drive
+#   env-vault verify [ARCHIVE]      # Decrypt in memory and count files (asks passphrase)
+#   env-vault restore [ARCHIVE] [--to DIR] [--only PATTERN]
+#
+# Keep the passphrase on paper. Without it the archives cannot be opened.
+#
+# Overrides (space-separated lists): ENV_VAULT_SCAN_DIRS, ENV_VAULT_EXTRA_PATHS,
+# ENV_VAULT_KEY_DIR, ENV_VAULT_NAS_DIR, ENV_VAULT_ICLOUD_DIR, ENV_VAULT_KEEP.
+#
+set -e
+setopt pipefail
+
+SCRIPT_PATH="${0:A}"   # $0 is the function name inside functions
+SCRIPT_DIR="${SCRIPT_PATH:h}"
+source "$SCRIPT_DIR/../lib/common.sh"
+
+# launchd starts jobs with a bare PATH; age lives in Homebrew.
+path=(/opt/homebrew/bin /usr/local/bin $path)
+
+KEY_DIR="${ENV_VAULT_KEY_DIR:-$HOME/.config/env-vault}"
+IDENTITY="$KEY_DIR/identity.age"      # private key, encrypted with your passphrase
+RECIPIENT="$KEY_DIR/recipient.txt"    # public key
+FINGERPRINT="$KEY_DIR/last-fingerprint"
+NAS_DEST="${ENV_VAULT_NAS_DIR:-$(nas_to_mount_path "$NAS_STORAGE_BASE")/secrets/env-vault}"
+ICLOUD_DEST="${ENV_VAULT_ICLOUD_DIR:-$HOME/Library/Mobile Documents/com~apple~CloudDocs/env-vault}"
+VW_BACKUPS="$(nas_to_mount_path "$NAS_STORAGE_BASE")/secrets/vaultwarden"
+KEEP=${ENV_VAULT_KEEP:-60}
+
+SCAN_DIRS=(${=ENV_VAULT_SCAN_DIRS:-$HOME/dev})
+EXTRA_PATHS=(${=ENV_VAULT_EXTRA_PATHS:-$HOME/.ssh})
+NAME_PATTERNS=(.env '.env.*' '*.env' .envrc .dev.vars '.dev.vars.*')
+PRUNE_DIRS=(node_modules .venv venv .git .next .turbo .expo Pods DerivedData __pycache__ .pnpm-store)
+
+show_help() { sed -n '2,25p' "$SCRIPT_PATH" | sed 's/^# \{0,1\}//'; }
+
+require_age() {
+    command -v age >/dev/null || { log_error "age is not installed: brew install age"; exit 1; }
+}
+
+require_key() {
+    [ -f "$RECIPIENT" ] || { log_error "No key yet. Run: env-vault init"; exit 1; }
+}
+
+# Reachable destinations, one per line. The NAS counts when the share is mounted.
+destinations() {
+    [ -d "${NAS_DEST:h}" ] && print -r -- "$NAS_DEST"
+    [ -d "${ICLOUD_DEST:h}" ] && print -r -- "$ICLOUD_DEST"
+    return 0
+}
+
+manifest_files() {
+    python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["files"])' "$1" 2>/dev/null || echo "?"
+}
+
+# Files to back up, one per line: relative to $HOME when inside it, else absolute.
+collect_files() {
+    local -a prune_expr name_expr
+    prune_expr=( \( -name "${PRUNE_DIRS[1]}" )
+    for d in ${PRUNE_DIRS[2,-1]}; do prune_expr+=( -o -name "$d" ); done
+    prune_expr+=( \) -prune )
+    name_expr=( \( -name "${NAME_PATTERNS[1]}" )
+    for n in ${NAME_PATTERNS[2,-1]}; do name_expr+=( -o -name "$n" ); done
+    name_expr+=( \) )
+    {
+        for dir in $SCAN_DIRS; do
+            [ -d "$dir" ] || continue
+            find "$dir" "${prune_expr[@]}" -o -type f "${name_expr[@]}" \
+                ! -name '*.example' ! -name '*.sample' ! -name '*.template' ! -name '*.swp' -print
+        done
+        for p in $EXTRA_PATHS; do
+            [ -e "$p" ] && find "$p" -type f ! -name '.DS_Store' -print
+        done
+        local -a vw=("$VW_BACKUPS"/vaultwarden-*.tar.gz(Nom[1]))
+        (( ${#vw} )) && print -r -- "${vw[1]}"
+        return 0
+    } | while IFS= read -r f; do
+        if [[ "$f" == "$HOME/"* ]]; then print -r -- "${f#$HOME/}"; else print -r -- "$f"; fi
+    done | sort -u
+}
+
+cmd_init() {
+    require_age
+    if [ -f "$IDENTITY" ]; then
+        log_error "$IDENTITY already exists. Delete it yourself first if you really mean to start over;"
+        log_error "archives made with the old key can only be opened with the old key."
+        exit 1
+    fi
+    [ -t 0 ] || { log_error "init needs a terminal: you type the passphrase"; exit 1; }
+    mkdir -p "$KEY_DIR" && chmod 700 "$KEY_DIR"
+
+    log_step "Creating an age key"
+    echo "  age will ask for a passphrase twice. Leave it empty and age generates a strong one"
+    echo "  and prints it. Either way, write it on paper. It is the only way back in."
+    echo ""
+    local key pub
+    key=$(age-keygen 2>/dev/null)
+    pub=$(print -r -- "$key" | age-keygen -y)
+    if ! print -r -- "$key" | age -p -a -o "$IDENTITY.partial"; then
+        unset key; rm -f "$IDENTITY.partial"; log_error "Cancelled"; exit 1
+    fi
+    unset key
+    mv "$IDENTITY.partial" "$IDENTITY"
+    print -r -- "$pub" > "$RECIPIENT"
+    chmod 600 "$IDENTITY" "$RECIPIENT"
+
+    # The encrypted identity is useless without the passphrase, so keep copies
+    # next to the archives: if the Mac dies, NAS or iCloud plus paper gets you back.
+    for dest in ${(f)"$(destinations)"}; do
+        mkdir -p "$dest" && cp "$IDENTITY" "$RECIPIENT" "$dest/"
+    done
+    log_success "Key created. Public key: $pub"
+    log_info "Next: env-vault backup, then env-vault verify to prove the passphrase works"
+}
+
+cmd_backup() {
+    local force=$1
+    require_age; require_key
+    local list=$(mktemp) errs=$(mktemp)
+    collect_files > "$list"
+    local count=$(wc -l < "$list" | tr -d ' ')
+    (( count > 0 )) || { log_error "No files found to back up"; rm -f "$list" "$errs"; exit 1; }
+
+    # Skip when nothing changed since the last archive (paths, sizes, mtimes).
+    local fp=$( (cd "$HOME" && while IFS= read -r f; do stat -f '%N %z %m' "$f"; done < "$list") | shasum -a 256 | cut -d' ' -f1)
+    if ! $force && [ -f "$FINGERPRINT" ] && [ "$(cat "$FINGERPRINT")" = "$fp" ]; then
+        log_info "No changes since the last backup ($count files); nothing to do"
+        rm -f "$list" "$errs"; return 0
+    fi
+
+    local -a dests=(${(f)"$(destinations)"})
+    (( ${#dests} )) || { log_error "Neither the NAS share nor iCloud Drive is available"; rm -f "$list" "$errs"; exit 1; }
+
+    local name="env-vault-$(date +%Y%m%d-%H%M%S).tar.gz.age"
+    local first=${dests[1]}
+    mkdir -p "$first"
+    log_step "Encrypting $count files to $first"
+    # tar -> age in one pipe, so the plaintext bundle never exists on disk.
+    if ! (cd "$HOME" && tar -czf - -T "$list" 2> "$errs") | age -R "$RECIPIENT" -o "$first/$name.partial"; then
+        log_error "Encryption failed:"; grep -v "Removing leading" "$errs" | tail -5 >&2
+        rm -f "$first/$name.partial" "$list" "$errs"; exit 1
+    fi
+    if grep -v "Removing leading" "$errs" | grep -q .; then
+        log_warn "tar reported:"; grep -v "Removing leading" "$errs" | tail -5
+    fi
+    rm -f "$list" "$errs"
+    head -c 21 "$first/$name.partial" | grep -q '^age-encryption.org/v1' || { log_error "Output is not an age file"; exit 1; }
+    mv "$first/$name.partial" "$first/$name"
+    local sha=$(shasum -a 256 "$first/$name" | cut -d' ' -f1)
+    local manifest="$first/${name%.tar.gz.age}.json"
+    printf '{"files": %d, "sha256": "%s", "created": "%s"}\n' "$count" "$sha" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$manifest"
+
+    for dest in ${dests[2,-1]}; do
+        mkdir -p "$dest"
+        cp "$first/$name" "$dest/$name.partial" && mv "$dest/$name.partial" "$dest/$name"
+        cp "$manifest" "$dest/"
+        [ "$(shasum -a 256 "$dest/$name" | cut -d' ' -f1)" = "$sha" ] || log_warn "Copy to $dest does not match"
+    done
+    for dest in $dests; do
+        [ -f "$dest/identity.age" ] || cp "$IDENTITY" "$RECIPIENT" "$dest/" 2>/dev/null || true
+        for old in "$dest"/env-vault-*.tar.gz.age(Nom[$((KEEP + 1)),-1]); do
+            rm -f "$old" "${old%.tar.gz.age}.json"
+        done
+    done
+    print -r -- "$fp" > "$FINGERPRINT"
+    log_success "$name ($count files) -> ${(j:, :)dests}"
+    (( ${#dests} < 2 )) && log_warn "Only one destination was reachable this run"
+    return 0
+}
+
+latest_archive() {
+    local -a found
+    for dest in ${(f)"$(destinations)"}; do
+        found+=("$dest"/env-vault-*.tar.gz.age(Nom[1]))
+    done
+    (( ${#found} )) && print -r -- "${found[1]}"
+    return 0
+}
+
+cmd_list() {
+    for dest in ${(f)"$(destinations)"}; do
+        print_header "$dest"
+        local -a archives=("$dest"/env-vault-*.tar.gz.age(Nom))
+        (( ${#archives} )) || echo "  (none)"
+        for f in $archives; do
+            printf "  %-40s %6s files  %s\n" "${f:t}" "$(manifest_files "${f%.tar.gz.age}.json")" "$(du -h "$f" | cut -f1)"
+        done
+    done
+}
+
+cmd_status() {
+    local latest=$(latest_archive)
+    print_header "env-vault"
+    print_kv "Key" "$([ -f "$IDENTITY" ] && echo "$IDENTITY" || echo 'missing (run env-vault init)')"
+    [ -f "$RECIPIENT" ] && print_kv "Public key" "$(cat "$RECIPIENT")"
+    print_kv "NAS" "$([ -d "${NAS_DEST:h}" ] && echo "$NAS_DEST" || echo 'not mounted')"
+    print_kv "iCloud Drive" "$([ -d "${ICLOUD_DEST:h}" ] && echo "$ICLOUD_DEST" || echo 'not available')"
+    print_kv "Latest" "${${latest:t}:-none}"
+    print_kv "Files now" "$(collect_files | wc -l | tr -d ' ')"
+}
+
+identity_for() {
+    # Prefer the local key; fall back to the copy stored next to the archive.
+    if [ -f "$IDENTITY" ]; then print -r -- "$IDENTITY"; else print -r -- "${1:h}/identity.age"; fi
+}
+
+cmd_verify() {
+    require_age
+    local archive=${1:-$(latest_archive)}
+    [ -f "$archive" ] || { log_error "No archive found"; exit 1; }
+    log_step "Decrypting ${archive:t} in memory (enter your passphrase)"
+    local n want listing
+    if ! listing=$(age -d -i "$(identity_for "$archive")" "$archive" | tar -tzf -); then
+        log_error "Could not decrypt ${archive:t}: wrong passphrase or wrong key"; exit 1
+    fi
+    n=$(print -r -- "$listing" | grep -vc '/$')
+    want=$(manifest_files "${archive%.tar.gz.age}.json")
+    if [ "$n" = "$want" ]; then
+        log_success "Decryption works; $n files match the manifest"
+    else
+        log_error "Decrypted $n files, manifest says $want"; exit 1
+    fi
+}
+
+cmd_restore() {
+    require_age
+    local archive="" to="" only=""
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --to) to=$2; shift 2 ;;
+            --only) only=$2; shift 2 ;;
+            *) archive=$1; shift ;;
+        esac
+    done
+    archive=${archive:-$(latest_archive)}
+    [ -f "$archive" ] || { log_error "No archive found"; exit 1; }
+    to=${to:-$HOME/env-vault-restore-$(date +%Y%m%d-%H%M%S)}
+    if [ -e "$to" ] && [ -n "$(ls -A "$to" 2>/dev/null)" ]; then
+        log_error "$to is not empty; pick an empty or new directory"; exit 1
+    fi
+    mkdir -p "$to" && chmod 700 "$to"
+    log_step "Restoring ${archive:t} into $to (enter your passphrase)"
+    local -a filter=()
+    [ -n "$only" ] && filter=(--include "$only")
+    age -d -i "$(identity_for "$archive")" "$archive" | tar -xzf - -C "$to" "${filter[@]}"
+    log_success "Restored $(find "$to" -type f | wc -l | tr -d ' ') files (paths relative to your home folder)."
+    log_info "Copy back what you need, then delete $to"
+}
+
+case "${1:-}" in
+    init) cmd_init ;;
+    backup) if [ "${2:-}" = "--force" ]; then cmd_backup true; else cmd_backup false; fi ;;
+    status) cmd_status ;;
+    list) cmd_list ;;
+    verify) shift; cmd_verify "$@" ;;
+    restore) shift; cmd_restore "$@" ;;
+    -h|--help|"") show_help ;;
+    *) log_error "Unknown command: $1"; show_help; exit 1 ;;
+esac

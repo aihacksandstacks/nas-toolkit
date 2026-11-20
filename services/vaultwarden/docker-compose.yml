@@ -1,0 +1,41 @@
+# Vaultwarden (Bitwarden-compatible password manager) for Black-Betty.
+#
+# Clients encrypt every vault item with the master password before it leaves
+# the device, so this server, the NAS, and its backups only ever hold
+# ciphertext. Root on the NAS cannot read your passwords.
+#
+# Reachable only on the tailnet, at
+#   https://black-betty.tail584407.ts.net:10443
+# via Tailscale Serve (valid cert, required by the web vault and extensions).
+# The container itself binds to 127.0.0.1 only.
+#
+# Install and upgrade with ./install-on-nas.sh. Read the release notes at
+# https://github.com/dani-garcia/vaultwarden/releases before bumping the image.
+
+name: vaultwarden
+
+services:
+  vaultwarden:
+    container_name: vaultwarden
+    image: vaultwarden/server:1.37.5@sha256:4fe17f415f90087377d37c755e0ea3cf189dcc6794e49cdd2a9adbb4937d9e1f
+    restart: always
+    user: "10010:10010"
+    env_file: .env
+    environment:
+      ROCKET_PORT: "8080"          # unprivileged port, so the container needs no root
+      IP_HEADER: X-Forwarded-For   # Tailscale Serve sets it; keeps real client IPs in logs
+      INVITATIONS_ALLOWED: "false"
+      PASSWORD_HINTS_ALLOWED: "false"
+      SHOW_PASSWORD_HINT: "false"
+      # No ADMIN_TOKEN: the /admin panel stays disabled.
+    volumes:
+      - /volume1/docker/vaultwarden/data:/data
+    ports:
+      - "127.0.0.1:8812:8080"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 256m
+    memswap_limit: 256m
+    cpus: 0.5

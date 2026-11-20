@@ -126,6 +126,24 @@ dev-restore --list
 
 It checks the sha256 against the manifest before extracting and never overwrites an existing directory. Reinstall dependencies afterwards; it prints the commands for the lockfiles it finds.
 
+### `env-vault`
+
+Encrypted backups of every `.env`-style file under `~/dev` (`.env`, `.env.*`, `*.env`, `.envrc`, `.dev.vars`), `~/.ssh`, and the newest Vaultwarden backup from the NAS. It runs `tar` straight into `age`, so the plaintext bundle never touches disk, then writes the result to `mac-offload/secrets/env-vault/` on the NAS and to `iCloud Drive/env-vault/`.
+
+```bash
+env-vault init                 # Once: create the key, you type the passphrase
+env-vault backup [--force]     # launchd runs this daily at 21:30; skips when nothing changed
+env-vault verify               # Decrypt the newest archive in memory and check the file count
+env-vault restore --to ~/tmp/r [--only '*cabana-web/.env*']
+env-vault status | list
+```
+
+- Encrypting uses only the public key (`~/.config/env-vault/recipient.txt`), so the nightly job needs no secret.
+- Decrypting needs `identity.age` and its passphrase. A copy of `identity.age` sits next to the archives on both destinations, so a dead Mac is recoverable from the NAS or iCloud plus the passphrase. Being logged in to the Mac, or holding the NAS or iCloud account, is not enough.
+- Write the passphrase on paper. There is no reset.
+- Run `env-vault verify` now and then. It proves the passphrase still works.
+- Restore always extracts into a new or empty directory, never over your files.
+
 ### `space-audit`
 
 Comprehensive disk usage analysis with recommendations.
@@ -220,6 +238,9 @@ Created on your NAS inside your home share, at `/home/<user>/mac-offload/`. Usin
 ```
 mac-offload/
 ├── models/             # AI model files (the Mac links here)
+├── secrets/
+│   ├── env-vault/      # age-encrypted .env/SSH bundles + passphrase-locked identity.age
+│   └── vaultwarden/    # nightly Vaultwarden backups (vault items are client-side encrypted)
 └── archives/
     └── repos/
         ├── old-project.tar.gz

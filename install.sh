@@ -138,6 +138,20 @@ if [ -f "$TOOLKIT_DIR/$TM_PLIST_NAME.template" ]; then
     echo -e "${GREEN}Time Machine health service installed (runs every 6 hours)${NC}"
 fi
 
+# Install the nightly encrypted .env/key backup (env-vault). It does nothing
+# until `env-vault init` has created a key.
+EV_PLIST_NAME="com.nas-toolkit.env-vault.plist"
+if [ -f "$TOOLKIT_DIR/$EV_PLIST_NAME.template" ]; then
+    sed "s|__TOOLKIT_DIR__|$TOOLKIT_DIR|g" \
+        "$TOOLKIT_DIR/$EV_PLIST_NAME.template" \
+        > "$LAUNCHD_DIR/$EV_PLIST_NAME"
+
+    launchctl unload "$LAUNCHD_DIR/$EV_PLIST_NAME" 2>/dev/null || true
+    launchctl load "$LAUNCHD_DIR/$EV_PLIST_NAME"
+
+    echo -e "${GREEN}env-vault nightly backup installed (21:30 daily; run 'env-vault init' once first)${NC}"
+fi
+
 # Step 5: Create mount point if needed
 echo -e "${BLUE}[5/5]${NC} Checking mount point..."
 source "$TOOLKIT_DIR/config.sh" 2>/dev/null || true
@@ -166,6 +180,7 @@ echo "  nas-mount      - Mount NAS share manually"
 echo "  dev-clean      - Clean project build artifacts"
 echo "  dev-archive    - Archive projects to NAS"
 echo "  dev-restore    - Restore archived projects"
+echo "  env-vault      - Encrypted backups of .env files and SSH keys (NAS + iCloud)"
 echo "  space-audit    - Analyze disk usage"
 echo "  tm-health      - Check Time Machine backups and the NAS share they use"
 echo "  snapshot-reap  - List and delete Time Machine local snapshots"

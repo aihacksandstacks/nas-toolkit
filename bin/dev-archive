@@ -1,382 +1,256 @@
 #!/bin/zsh
 #
-# dev-archive - Archive development projects to NAS
+# dev-archive - Archive inactive projects to the NAS
 #
-# Moves inactive projects to NAS cold storage to free local disk space.
-# Projects can be restored later with dev-restore.
+# Writes <project>.tar.gz plus a .json manifest to the archives folder on the
+# NAS share, reads the archive back to verify it, and only then (with --clean)
+# deletes the local copy. The archive keeps .git, stashes, unpushed branches
+# and untracked files such as .env; it leaves out directories a package manager
+# rebuilds (node_modules, .venv, Pods, ...).
 #
 # Usage:
-#   dev-archive /path/to/project   # Archive specific project
-#   dev-archive --list             # List archived projects on NAS
-#   dev-archive --stale 90         # Find projects to archive (90 days inactive)
-#   dev-archive --suggest          # Suggest projects to archive based on activity
+#   dev-archive --suggest [DAYS]      # List projects idle DAYS+ days (default 90)
+#   dev-archive <project>             # Archive and verify, keep local copy
+#   dev-archive <project> --clean     # ...then delete the local copy
+#   dev-archive --list                # List archives on the NAS
+#   dev-restore <name>                # Bring one back
 #
 set -e
 
-SCRIPT_DIR="${0:A:h}"
+SCRIPT_PATH="${0:A}"   # $0 is the function name inside functions
+SCRIPT_DIR="${SCRIPT_PATH:h}"
 source "$SCRIPT_DIR/../lib/common.sh"
 
-# Archive index file (tracks what's been archived)
-ARCHIVE_INDEX="$HOME/.nas-toolkit-archives.json"
+DEV_DIR="${DEV_ARCHIVE_DEV_DIR:-$HOME/dev}"
+ARCHIVE_DIR="$(nas_to_mount_path "$NAS_ARCHIVE_DIR")/repos"
+
+# Directory names a package manager or build tool regenerates.
+REBUILDABLE=(node_modules .venv venv __pycache__ .next .turbo .expo .parcel-cache
+             .pnpm-store Pods DerivedData .gradle .pytest_cache .mypy_cache .ruff_cache)
 
 show_help() {
+    sed -n '2,18p' "$SCRIPT_PATH" | sed 's/^# \{0,1\}//'
     cat << EOF
-${BOLD}dev-archive${NC} - Archive development projects to NAS
 
-${BOLD}USAGE:${NC}
-    dev-archive <project>          Archive a specific project
-    dev-archive --list             List all archived projects
-    dev-archive --suggest          Suggest projects to archive based on activity
-    dev-archive --stale DAYS       Show projects not modified in DAYS days
-    dev-archive --clean            Clean local copy after archiving
-
-${BOLD}OPTIONS:${NC}
-    --list, -l          List archived projects on NAS
-    --suggest, -s       Analyze projects and suggest archival candidates
-    --stale DAYS        Filter to projects inactive for DAYS days
-    --clean             Remove local copy after successful archive
-    --force             Skip confirmation prompts
-    -h, --help          Show this help message
-
-${BOLD}WHAT HAPPENS:${NC}
-    1. Project is cleaned (node_modules, etc. removed)
-    2. Project is compressed and transferred to NAS
-    3. Metadata is saved for easy restoration
-    4. Optionally, local copy is removed
-
-${BOLD}EXAMPLES:${NC}
-    dev-archive ~/dev/old-project          # Archive a project
-    dev-archive --list                      # See what's archived
-    dev-archive --suggest                   # Get archival recommendations
-    dev-archive --stale 90                  # Find 90-day inactive projects
-
+Options:
+    --clean       Delete the local copy after the archive verifies
+    --force       Skip confirmation prompts
+    -h, --help    Show this help
 EOF
 }
 
-# Get project metadata
-get_project_info() {
-    local project_dir=$1
-    local project_name=$(basename "$project_dir")
-
-    # Get git remote if available
-    local git_remote=""
-    if [ -d "$project_dir/.git" ]; then
-        git_remote=$(git -C "$project_dir" remote get-url origin 2>/dev/null || echo "")
+# Make sure the NAS share is mounted; try nas-mount once.
+require_mount() {
+    if [ ! -d "${ARCHIVE_DIR:h}" ]; then
+        "$SCRIPT_DIR/nas-mount" >/dev/null 2>&1 || true
     fi
-
-    # Get last modification time
-    local last_modified=$(find "$project_dir" -type f -not -path "*/.git/*" -not -path "*/node_modules/*" -printf '%T@\n' 2>/dev/null | sort -rn | head -1)
-    local last_modified_date=""
-    if [ -n "$last_modified" ]; then
-        last_modified_date=$(date -r "${last_modified%.*}" "+%Y-%m-%d" 2>/dev/null || echo "unknown")
-    fi
-
-    # Get size
-    local size=$(du -sh "$project_dir" 2>/dev/null | cut -f1 || echo "unknown")
-
-    cat << EOF
-{
-    "name": "$project_name",
-    "original_path": "$project_dir",
-    "git_remote": "$git_remote",
-    "last_modified": "$last_modified_date",
-    "local_size": "$size",
-    "archived_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-}
-EOF
-}
-
-# List archived projects
-list_archives() {
-    print_header "Archived Projects"
-
-    if ! check_nas_ssh; then
-        log_error "Cannot connect to NAS"
+    if [ ! -d "${ARCHIVE_DIR:h}" ]; then
+        log_error "NAS archive folder not reachable: ${ARCHIVE_DIR:h}"
+        log_info "Mount the share with nas-mount, then retry"
         exit 1
     fi
-
-    local archives=$(nas_run "ls -1 '$NAS_ARCHIVE_DIR/repos/' 2>/dev/null" || echo "")
-
-    if [ -z "$archives" ]; then
-        log_info "No archived projects found"
-        return 0
-    fi
-
-    echo ""
-    printf "  ${BOLD}%-30s %-12s %-20s${NC}\n" "PROJECT" "SIZE" "ARCHIVED"
-    hr
-
-    while IFS= read -r archive; do
-        if [[ "$archive" == *.tar.gz ]]; then
-            local name="${archive%.tar.gz}"
-            local size=$(nas_run "du -sh '$NAS_ARCHIVE_DIR/repos/$archive' 2>/dev/null | cut -f1" || echo "?")
-            local date=$(nas_run "stat -c '%y' '$NAS_ARCHIVE_DIR/repos/$archive' 2>/dev/null | cut -d' ' -f1" || echo "?")
-            printf "  %-30s %-12s %-20s\n" "$name" "$size" "$date"
-        fi
-    done <<< "$archives"
-
-    echo ""
+    mkdir -p "$ARCHIVE_DIR"
 }
 
-# Suggest projects to archive
-suggest_archives() {
-    local stale_days=${1:-60}
-    local dev_dir="$HOME/dev"
+# Echo "yes" if any file outside .git and rebuildable dirs changed within DAYS.
+recently_touched() {
+    local dir=$1 days=$2
+    local -a expr=( \( -name .git )
+    for d in $REBUILDABLE; do expr+=( -o -name "$d" ); done
+    expr+=( \) -prune -o -type f -mtime "-$days" -print -quit )
+    [ -n "$(find "$dir" "${expr[@]}" 2>/dev/null)" ] && echo yes || echo no
+}
 
-    print_header "Archive Suggestions"
-
-    echo ""
-    log_info "Scanning for projects not modified in $stale_days days..."
-    echo ""
-
-    local suggestions=()
-    local total_size=0
-
-    while IFS= read -r -d '' git_dir; do
-        local project_dir=$(dirname "$git_dir")
-        local project_name=$(basename "$project_dir")
-
-        # Check if recently modified
-        local recent=$(find "$project_dir" -type f -not -path "*/.git/*" -not -path "*/node_modules/*" -mtime -"$stale_days" 2>/dev/null | head -1)
-
-        if [ -z "$recent" ]; then
-            local size=$(du -sh "$project_dir" 2>/dev/null | cut -f1 || echo "?")
-            local size_bytes=$(du -sk "$project_dir" 2>/dev/null | cut -f1 || echo 0)
-            local last_mod=$(find "$project_dir" -type f -not -path "*/.git/*" -printf '%T@\n' 2>/dev/null | sort -rn | head -1)
-            local last_date=""
-            if [ -n "$last_mod" ]; then
-                last_date=$(date -r "${last_mod%.*}" "+%Y-%m-%d" 2>/dev/null || echo "unknown")
-            fi
-
-            suggestions+=("$project_dir|$size|$last_date")
-            total_size=$((total_size + size_bytes * 1024))
-        fi
-    done < <(find "$dev_dir" -maxdepth 3 -type d -name ".git" -print0 2>/dev/null)
-
-    if [ ${#suggestions[@]} -eq 0 ]; then
-        log_success "No stale projects found! All projects are active."
-        return 0
+git_status_summary() {
+    local dir=$1
+    if [ ! -d "$dir/.git" ]; then
+        echo "no git"
+        return
     fi
+    local dirty=$(git -C "$dir" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+    local unpushed=$(git -C "$dir" log --branches --not --remotes --oneline 2>/dev/null | wc -l | tr -d ' ')
+    local stashes=$(git -C "$dir" stash list 2>/dev/null | wc -l | tr -d ' ')
+    local -a parts
+    (( dirty )) && parts+=("$dirty dirty")
+    (( unpushed )) && parts+=("$unpushed unpushed")
+    (( stashes )) && parts+=("$stashes stash")
+    [ -z "$(git -C "$dir" remote 2>/dev/null)" ] && parts+=("no remote")
+    echo "${${(j:, :)parts}:-clean, pushed}"
+}
 
-    local total_human=$(format_bytes $total_size)
-    log_info "Found ${#suggestions[@]} inactive projects ($total_human total):"
-    echo ""
+linked_worktrees() {
+    git -C "$1" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2}' | tail -n +2
+}
 
-    printf "  ${BOLD}%-35s %-10s %-15s${NC}\n" "PROJECT" "SIZE" "LAST MODIFIED"
-    hr
-
-    for suggestion in "${suggestions[@]}"; do
-        IFS='|' read -r path size last_date <<< "$suggestion"
-        local name=$(basename "$path")
-        printf "  %-35s %-10s %-15s\n" "$name" "$size" "$last_date"
+suggest() {
+    local days=${1:-90}
+    print_header "Projects idle ${days}+ days in $DEV_DIR"
+    printf "  ${BOLD}%-36s %8s  %-11s %s${NC}\n" "PROJECT" "SIZE" "LAST COMMIT" "STATE"
+    local found=0
+    for dir in "$DEV_DIR"/*(N/); do
+        [ -d "$dir/.git" ] || continue
+        [ "$(recently_touched "$dir" "$days")" = yes ] && continue
+        local last=$(git -C "$dir" log -1 --format=%cs 2>/dev/null || echo "-")
+        local state=$(git_status_summary "$dir")
+        local wts=$(linked_worktrees "$dir" | wc -l | tr -d ' ')
+        (( wts )) && state="$state, $wts worktrees"
+        printf "  %-36s %8s  %-11s %s\n" "${dir:t}" "$(get_dir_size "$dir")" "$last" "$state"
+        found=$((found + 1))
     done
-
+    (( found )) || log_success "Nothing idle for ${days}+ days"
     echo ""
-    log_info "To archive a project: dev-archive /path/to/project"
-    log_info "To archive all:       dev-archive --stale $stale_days --all"
+    log_info "Sizes include node_modules etc., which the archive leaves out."
+    log_info "Archive one with: dev-archive <path> --clean"
 }
 
-# Archive a single project
+list_archives() {
+    require_mount
+    print_header "Archives in $ARCHIVE_DIR"
+    local any=false
+    for f in "$ARCHIVE_DIR"/*.tar.gz(N); do
+        any=true
+        local name=${f:t:r:r}
+        local remote="-"
+        [ -f "${f:r:r}.json" ] && remote=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("git_remote") or "-")' "${f:r:r}.json" 2>/dev/null)
+        printf "  %-36s %8s  %s  %s\n" "$name" "$(du -h "$f" | cut -f1)" "$(stat -f %Sm -t %Y-%m-%d "$f")" "$remote"
+    done
+    $any || log_info "No archives yet"
+}
+
+write_manifest() {
+    local out=$1; shift
+    python3 -I - "$out" "$@" << 'PY'
+import json, sys
+out, *pairs = sys.argv[1:]
+data = dict(zip(pairs[::2], pairs[1::2]))
+for k in ("file_count", "unpushed_commits", "dirty_files", "stashes"):
+    if k in data and data[k].isdigit():
+        data[k] = int(data[k])
+with open(out, "w") as fh:
+    json.dump(data, fh, indent=2)
+    fh.write("\n")
+PY
+}
+
 archive_project() {
-    local project_dir=$1
-    local clean_local=${2:-false}
-    local force=${3:-false}
+    local dir=${1:A} clean=$2 force=$3
+    [ -d "$dir" ] || { log_error "Not a directory: $dir"; return 1; }
 
-    if [ ! -d "$project_dir" ]; then
-        log_error "Project directory not found: $project_dir"
+    if [ -f "$dir/.git" ]; then
+        log_error "$dir is a linked git worktree. Remove it with: git worktree remove $dir"
+        return 1
+    fi
+    local wts=$(linked_worktrees "$dir")
+    if [ -n "$wts" ]; then
+        log_error "$dir has linked worktrees; archiving would orphan them:"
+        echo "$wts" | sed 's/^/    /'
+        log_info "Remove them first (git worktree remove <path>)"
         return 1
     fi
 
-    local project_name=$(basename "$project_dir")
-    local archive_name="${project_name}.tar.gz"
-    local nas_archive_path="$NAS_ARCHIVE_DIR/repos/$archive_name"
+    require_mount
+    local name=${dir:t}
+    local final="$ARCHIVE_DIR/$name.tar.gz"
+    local partial="$final.partial"
+    local manifest="$ARCHIVE_DIR/$name.json"
 
-    print_header "Archiving: $project_name"
-
-    # Check NAS connection
-    if ! check_nas_ssh; then
-        log_error "Cannot connect to NAS"
-        return 1
+    local remote="" branch="" head="" dirty=0 unpushed=0 stashes=0
+    if [ -d "$dir/.git" ]; then
+        remote=$(git -C "$dir" remote get-url origin 2>/dev/null || true)
+        branch=$(git -C "$dir" branch --show-current 2>/dev/null || true)
+        head=$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)
+        dirty=$(git -C "$dir" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+        unpushed=$(git -C "$dir" log --branches --not --remotes --oneline 2>/dev/null | wc -l | tr -d ' ')
+        stashes=$(git -C "$dir" stash list 2>/dev/null | wc -l | tr -d ' ')
     fi
 
-    # Get project info
-    local size=$(du -sh "$project_dir" 2>/dev/null | cut -f1 || echo "?")
-    local git_remote=""
-    if [ -d "$project_dir/.git" ]; then
-        git_remote=$(git -C "$project_dir" remote get-url origin 2>/dev/null || echo "none")
-    fi
-
+    print_header "Archiving $name"
+    print_kv "Source" "$dir"
+    print_kv "Destination" "$final"
+    print_kv "Git" "$(git_status_summary "$dir")"
+    print_kv "Delete local after" "$clean"
     echo ""
-    print_kv "Project" "$project_name"
-    print_kv "Size" "$size"
-    print_kv "Git Remote" "$git_remote"
-    print_kv "NAS Location" "$nas_archive_path"
-    echo ""
-
-    # Check if already archived
-    if nas_run "[ -f '$nas_archive_path' ]" 2>/dev/null; then
-        log_warn "Archive already exists on NAS"
-        if ! $force && ! confirm "Overwrite existing archive?"; then
-            log_info "Cancelled"
-            return 0
-        fi
-    fi
-
-    if ! $force && ! confirm "Archive this project to NAS?"; then
+    if ! $force && ! confirm "Archive $name?"; then
         log_info "Cancelled"
         return 0
     fi
 
-    # Step 1: Clean the project first
-    log_step "Step 1: Cleaning project..."
-    "$SCRIPT_DIR/dev-clean" --all "$project_dir" 2>/dev/null || true
+    local -a excludes
+    for d in $REBUILDABLE; do excludes+=(--exclude "$d"); done
+    [ -f "$dir/Cargo.toml" ] && excludes+=(--exclude "./$name/target")
 
-    # Step 2: Create compressed archive
-    log_step "Step 2: Creating archive..."
-    local temp_archive="/tmp/${archive_name}"
-
-    # Use tar with gzip, excluding common large directories
-    tar -czf "$temp_archive" \
-        --exclude='node_modules' \
-        --exclude='.venv' \
-        --exclude='venv' \
-        --exclude='__pycache__' \
-        --exclude='.next' \
-        --exclude='dist' \
-        --exclude='build' \
-        --exclude='.turbo' \
-        -C "$(dirname "$project_dir")" \
-        "$project_name"
-
-    local archive_size=$(du -sh "$temp_archive" 2>/dev/null | cut -f1 || echo "?")
-    log_info "Compressed size: $archive_size"
-
-    # Step 3: Transfer to NAS
-    log_step "Step 3: Transferring to NAS..."
-    nas_mkdir "$NAS_ARCHIVE_DIR/repos"
-    rsync -avz --progress "$temp_archive" "$NAS_SSH_HOST:$nas_archive_path"
-
-    # Cleanup temp file
-    rm -f "$temp_archive"
-
-    # Save metadata
-    log_step "Step 4: Saving metadata..."
-    local metadata=$(get_project_info "$project_dir")
-    local metadata_path="$NAS_ARCHIVE_DIR/repos/${project_name}.json"
-    echo "$metadata" | nas_run "cat > '$metadata_path'"
-
-    # Optionally remove local copy
-    if $clean_local; then
-        log_step "Step 5: Removing local copy..."
-        rm -rf "$project_dir"
-        log_success "Local copy removed"
+    log_step "Writing archive to the NAS"
+    local listing=$(mktemp)
+    # bsdtar -v prints one "a <path>" line per entry on stderr.
+    if ! tar -czvf "$partial" "${excludes[@]}" -C "${dir:h}" "$name" 2> "$listing"; then
+        log_error "tar failed:"; tail -5 "$listing"; rm -f "$partial" "$listing"; return 1
     fi
+    local written=$(grep -c '^a ' "$listing" || true)
+    rm -f "$listing"
 
-    echo ""
-    log_success "Project archived successfully!"
-    echo ""
-    log_info "To restore: dev-restore $project_name"
-}
-
-# Find stale projects and optionally archive all
-handle_stale() {
-    local days=$1
-    local archive_all=${2:-false}
-
-    if ! $archive_all; then
-        suggest_archives "$days"
-        return 0
+    log_step "Verifying (reading the archive back)"
+    local readback=$(tar -tzf "$partial" | wc -l | tr -d ' ')
+    if [ "$readback" != "$written" ]; then
+        log_error "Verify failed: wrote $written entries, read back $readback. Local copy kept."
+        rm -f "$partial"
+        return 1
     fi
+    local sha=$(shasum -a 256 "$partial" | cut -d' ' -f1)
 
-    # Archive all stale projects
-    local dev_dir="$HOME/dev"
+    if [ -f "$final" ]; then
+        local stamp=$(stat -f %Sm -t %Y%m%d-%H%M%S "$final")
+        mv "$final" "$ARCHIVE_DIR/$name.$stamp.tar.gz"
+        [ -f "$manifest" ] && mv "$manifest" "$ARCHIVE_DIR/$name.$stamp.json"
+        log_info "Kept previous archive as $name.$stamp.tar.gz"
+    fi
+    mv "$partial" "$final"
+    write_manifest "$manifest" \
+        name "$name" original_path "$dir" git_remote "$remote" branch "$branch" head "$head" \
+        dirty_files "$dirty" unpushed_commits "$unpushed" stashes "$stashes" \
+        file_count "$written" sha256 "$sha" archived_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    log_success "Archived $written entries ($(du -h "$final" | cut -f1)), sha256 ${sha:0:12}"
 
-    print_header "Archiving Stale Projects"
-    log_info "Finding projects not modified in $days days..."
-    echo ""
-
-    while IFS= read -r -d '' git_dir; do
-        local project_dir=$(dirname "$git_dir")
-
-        # Check if recently modified
-        local recent=$(find "$project_dir" -type f -not -path "*/.git/*" -not -path "*/node_modules/*" -mtime -"$days" 2>/dev/null | head -1)
-
-        if [ -z "$recent" ]; then
-            archive_project "$project_dir" true true
-            echo ""
+    if $clean; then
+        if $force || confirm "Delete local copy $dir?"; then
+            local before=$(df -k /System/Volumes/Data | awk 'NR==2{print $4}')
+            rm -rf "$dir"
+            local after=$(df -k /System/Volumes/Data | awk 'NR==2{print $4}')
+            log_success "Deleted local copy, freed $(( (after - before) / 1024 ))MB"
+        else
+            log_info "Local copy kept"
         fi
-    done < <(find "$dev_dir" -maxdepth 3 -type d -name ".git" -print0 2>/dev/null)
-
-    log_success "Stale project archival complete"
+    fi
+    log_info "Restore with: dev-restore $name"
 }
 
-# Parse arguments
-CLEAN_LOCAL=false
-FORCE=false
-STALE_DAYS=0
-ARCHIVE_ALL=false
 ACTION=""
-PROJECT_PATH=""
+TARGET=""
+DAYS=90
+CLEAN=false
+FORCE=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        -h|--help)
-            show_help
-            exit 0
+        -h|--help) show_help; exit 0 ;;
+        -l|--list) ACTION=list; shift ;;
+        -s|--suggest|--stale)
+            ACTION=suggest; shift
+            [[ "$1" =~ ^[0-9]+$ ]] && { DAYS=$1; shift; }
             ;;
-        -l|--list)
-            ACTION="list"
-            shift
-            ;;
-        -s|--suggest)
-            ACTION="suggest"
-            shift
-            ;;
-        --stale)
-            ACTION="stale"
-            STALE_DAYS=$2
-            shift 2
-            ;;
-        --clean)
-            CLEAN_LOCAL=true
-            shift
-            ;;
-        --force)
-            FORCE=true
-            shift
-            ;;
+        --clean) CLEAN=true; shift ;;
+        --force) FORCE=true; shift ;;
         --all)
-            ARCHIVE_ALL=true
-            shift
-            ;;
-        -*)
-            log_error "Unknown option: $1"
-            show_help
+            log_error "--all was removed: it deleted every match without asking. Use --suggest, then archive each project."
             exit 1
             ;;
-        *)
-            PROJECT_PATH=$1
-            ACTION="archive"
-            shift
-            ;;
+        -*) log_error "Unknown option: $1"; show_help; exit 1 ;;
+        *) ACTION=archive; TARGET=$1; shift ;;
     esac
 done
 
-# Main
 case "$ACTION" in
-    list)
-        list_archives
-        ;;
-    suggest)
-        suggest_archives 60
-        ;;
-    stale)
-        handle_stale "$STALE_DAYS" "$ARCHIVE_ALL"
-        ;;
-    archive)
-        archive_project "$PROJECT_PATH" "$CLEAN_LOCAL" "$FORCE"
-        ;;
-    *)
-        show_help
-        ;;
+    list) list_archives ;;
+    suggest) suggest "$DAYS" ;;
+    archive) archive_project "$TARGET" "$CLEAN" "$FORCE" ;;
+    *) show_help ;;
 esac

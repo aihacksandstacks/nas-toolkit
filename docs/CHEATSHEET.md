@@ -13,8 +13,8 @@ space-audit
 # 3. Configure NAS
 nas-setup
 
-# 4. Move caches to NAS
-nas-cache setup
+# 4. Prune package caches
+cache-prune
 
 # 5. Remove Docker Desktop (biggest win!)
 nas-setup --uninstall-docker-desktop
@@ -44,11 +44,8 @@ docker compose up -d
 ## Cache Management
 
 ```bash
-nas-cache status          # See what's where
-nas-cache move npm        # Move npm to NAS
-nas-cache move pip        # Move pip to NAS
-nas-cache restore npm     # Bring back local
-nas-cache verify          # Check symlinks work
+cache-prune --dry-run     # Sizes and what would run
+cache-prune               # Prune npm/npx/uv/pnpm/pip/brew/conda caches
 ```
 
 ## Project Management
@@ -60,8 +57,9 @@ dev-clean --all
 # Clean stale projects only
 dev-clean --stale 30
 
-# Archive inactive project
-dev-archive ~/dev/old-project
+# Find idle projects, then archive one (verifies before deleting)
+dev-archive --suggest 90
+dev-archive ~/dev/old-project --clean
 
 # See what's archived
 dev-archive --list
@@ -101,8 +99,6 @@ ssh nas "echo ok"
 # Check Docker on NAS
 docker --context nas info
 
-# Verify cache symlinks
-nas-cache verify
 ```
 
 ## Quick Wins
@@ -110,7 +106,6 @@ nas-cache verify
 | Command | Typical Savings |
 |---------|-----------------|
 | `nas-setup --uninstall-docker-desktop` | 20-100 GB |
-| `nas-cache move npm` | 5-20 GB |
-| `nas-cache move pip` | 2-10 GB |
+| `cache-prune` | 5-20 GB |
 | `dev-clean --all` | 5-30 GB |
-| `dev-archive --stale 90 --all` | varies |
+| `dev-archive --suggest`, then `--clean` per project | varies |

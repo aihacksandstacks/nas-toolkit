@@ -170,7 +170,7 @@ audit_caches() {
     if [ $total_local -gt 0 ]; then
         local total_human=$(format_bytes $total_local)
         echo -e "  ${BOLD}Local caches: ${YELLOW}$total_human${NC}"
-        echo -e "  ${CYAN}Recommendation: Run 'nas-cache setup' to move to NAS${NC}"
+        echo -e "  ${CYAN}Recommendation: Run 'cache-prune' to prune them${NC}"
     else
         echo -e "  ${GREEN}All major caches on NAS or not present${NC}"
     fi
@@ -295,7 +295,7 @@ generate_recommendations() {
 
     # Check Time Machine local snapshots (pin space + block other cleanup)
     local snap_count=$(diskutil apfs listSnapshots "/System/Volumes/Data" 2>/dev/null \
-        | grep -c "com.apple.TimeMachine" || echo 0)
+        | grep -c "com.apple.TimeMachine" || true)
     if [ "$snap_count" -gt 2 ]; then
         recommendations+=("0|$snap_count snaps|Clear Time Machine local snapshots|snapshot-reap --reap")
     fi
@@ -327,7 +327,7 @@ generate_recommendations() {
 
     if [ $cache_total -gt 104857600 ]; then  # > 100MB
         total_recoverable=$((total_recoverable + cache_total))
-        recommendations+=("2|$(format_bytes $cache_total)|Move package caches to NAS|nas-cache setup")
+        recommendations+=("2|$(format_bytes $cache_total)|Prune package caches|cache-prune")
     fi
 
     # Check for cleanable dev artifacts

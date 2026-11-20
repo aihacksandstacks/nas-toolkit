@@ -1,0 +1,136 @@
+#!/bin/zsh
+#
+# cache-prune - Prune package-manager and dev-tool caches in place
+#
+# Everything this touches is a cache the owning tool re-downloads on demand,
+# so it is safe to run any time. It replaces nas-cache: symlinking caches onto
+# an SMB share over Tailscale made every install slow and broke the tools
+# whenever the share was not mounted.
+#
+# Usage:
+#   cache-prune              # Prune every cache it knows about
+#   cache-prune --dry-run    # Show sizes and what would run
+#   cache-prune --quiet      # One summary line (space-guard uses this)
+#   cache-prune --help
+#
+# npx installs under ~/.npm/_npx are removed only when no running process uses
+# them and they are older than CACHE_PRUNE_NPX_DAYS (default 30).
+#
+set -e
+
+SCRIPT_PATH="${0:A}"   # $0 is the function name inside functions
+SCRIPT_DIR="${SCRIPT_PATH:h}"
+source "$SCRIPT_DIR/../lib/common.sh"
+
+DATA_VOLUME="/System/Volumes/Data"
+NPX_DIR="$HOME/.npm/_npx"
+NPX_DAYS=${CACHE_PRUNE_NPX_DAYS:-30}
+
+DRY_RUN=false
+QUIET=false
+
+show_help() {
+    sed -n '2,19p' "$SCRIPT_PATH" | sed 's/^# \{0,1\}//'
+}
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -n|--dry-run) DRY_RUN=true; shift ;;
+        -q|--quiet)   QUIET=true; shift ;;
+        -h|--help)    show_help; exit 0 ;;
+        *) log_error "Unknown option: $1"; show_help; exit 1 ;;
+    esac
+done
+
+free_kb() { df -k "$DATA_VOLUME" | awk 'NR==2 {print $4}'; }
+
+say() { $QUIET || echo "$@"; }
+
+typeset -a failures
+TOTAL_START=$(free_kb)
+
+# Run one prune step. Measures freed space from the volume's free-space delta,
+# because du over-counts hard-linked stores (pnpm) and misses APFS clones.
+#   step <label> <path-to-size-or-empty> <command...>
+step() {
+    local label=$1 size_path=$2
+    shift 2
+    local size=""
+    [ -n "$size_path" ] && [ -e "$size_path" ] && size=$(get_dir_size "$size_path")
+
+    if $DRY_RUN; then
+        say "  ${label}${size:+ ($size)}: would run: $*"
+        return 0
+    fi
+
+    local before=$(free_kb) out
+    if out=$("$@" 2>&1); then
+        local freed_mb=$(( ($(free_kb) - before) / 1024 ))
+        (( freed_mb < 0 )) && freed_mb=0
+        say "  ${label}: freed ${freed_mb}MB"
+    else
+        failures+=("$label")
+        say "  ${label}: FAILED: $(echo "$out" | tail -1)"
+    fi
+}
+
+# npx dirs that a running process has on its command line (MCP servers etc.).
+npx_in_use() {
+    ps -axww -o command= 2>/dev/null | grep -o "_npx/[0-9a-f]*" | sed 's|_npx/||' | sort -u
+}
+
+prune_npx() {
+    [ -d "$NPX_DIR" ] || return 0
+    local in_use=$(npx_in_use) removed=0 kept_busy=0
+    for d in "$NPX_DIR"/*(N/); do
+        local hash=${d:t}
+        if echo "$in_use" | grep -qx "$hash"; then
+            kept_busy=$((kept_busy + 1))
+            continue
+        fi
+        # Skip if anything inside changed recently.
+        [ -n "$(find "$d" -maxdepth 2 -mtime -"$NPX_DAYS" -print -quit 2>/dev/null)" ] && continue
+        rm -rf "$d"
+        removed=$((removed + 1))
+    done
+    echo "removed $removed, kept $kept_busy in use"
+}
+
+say "${BOLD}cache-prune${NC}$($DRY_RUN && echo ' (dry run)')"
+
+command -v npm  >/dev/null && step "npm cache" "$HOME/.npm/_cacache" npm cache clean --force
+if $DRY_RUN; then
+    say "  npx installs ($(get_dir_size "$NPX_DIR")): would remove dirs idle ${NPX_DAYS}d+ and not in use"
+else
+    step "npx installs" "" prune_npx
+fi
+command -v uv   >/dev/null && step "uv cache" "$HOME/.cache/uv" uv cache prune
+command -v pnpm >/dev/null && step "pnpm store" "" pnpm store prune
+command -v python3 >/dev/null && python3 -m pip --version >/dev/null 2>&1 &&
+    step "pip cache" "$HOME/Library/Caches/pip" python3 -m pip cache purge
+command -v brew >/dev/null && step "Homebrew" "$HOME/Library/Caches/Homebrew" brew cleanup -s
+CONDA=$(command -v conda 2>/dev/null || ls /opt/homebrew/anaconda3/bin/conda 2>/dev/null || true)
+[ -n "$CONDA" ] && [ -x "$CONDA" ] && step "conda" "" "$CONDA" clean --all -y
+command -v xcrun >/dev/null && xcrun simctl help >/dev/null 2>&1 &&
+    step "simulators without a runtime" "" xcrun simctl delete unavailable
+
+# Leftovers from the retired nas-cache: a cache dir symlinked onto the share
+# breaks its tool whenever the share is unmounted.
+for p in "$HOME/.npm" "$HOME/.cargo" "$HOME/.cache/uv" "$HOME/Library/Caches/pip" \
+         "$HOME/Library/Caches/Homebrew" "$HOME/.pnpm-store" "$HOME/.yarn/cache" \
+         "$HOME/Library/Caches/CocoaPods" "$HOME/go/pkg/mod"; do
+    [ -L "$p" ] && say "  ${YELLOW}warning${NC}: $p is a symlink to $(readlink "$p"); copy it back so the tool works offline"
+done
+
+$DRY_RUN && exit 0
+
+TOTAL_MB=$(( ($(free_kb) - TOTAL_START) / 1024 ))
+(( TOTAL_MB < 0 )) && TOTAL_MB=0
+if $QUIET; then
+    echo "cache-prune freed ${TOTAL_MB}MB${failures:+ (failed: ${(j:, :)failures})}"
+else
+    echo ""
+    log_success "Freed ${TOTAL_MB}MB total"
+    [ ${#failures[@]} -gt 0 ] && log_warn "Failed: ${(j:, :)failures}"
+fi
+exit 0
